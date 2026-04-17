@@ -1,0 +1,18 @@
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.pdb
+*.efi
+build/
+Build/
+
+# Private signing material — NEVER commit
+mok/*.key
+mok/*.pfx
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

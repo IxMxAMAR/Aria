@@ -1,0 +1,65 @@
+[Defines]
+  INF_VERSION     = 0x00010005
+  BASE_NAME       = AriaEfi
+  FILE_GUID       = 12345678-abcd-ef01-2345-67890abcdef0
+  MODULE_TYPE     = UEFI_APPLICATION
+  VERSION_STRING  = 1.0
+  ENTRY_POINT     = UefiMain
+
+[Sources]
+  main.c
+  vmx_init.c
+  ept_init.c
+  serial.c
+  ../vmm/vmm.c
+  ../vmm/vmcs.c
+  ../vmm/ept.c
+  ../vmm/exit_handlers/cpuid.c
+  ../vmm/exit_handlers/ept_violation.c
+  ../vmm/exit_handlers/msr.c
+  ../vmm/exit_handlers/cr_access.c
+  ../vmm/nested/nested_vmx.c
+  ../vmm/nested/vm_entry.c
+  ../vmm/nested/exit_dispatch.c
+  ../vmm/nested/exit_reflect.c
+  ../vmm/nested/vmcs_merge.c
+  ../vmm/nested/vmcs_shadow.c
+  ../vmm/nested/shadow_ept.c
+  ../vmm/nested/shadow_ept_walk.c
+  ../vmm/nested/eptp_switch.c
+  ../vmm/nested/hv_interface.c
+  ../vmm/nested/vpid_mgr.c
+  ../vmm/nested/interrupt_nested.c
+  ../vmm/nested/preempt_timer.c
+  ../vmm/nested/cr_nested.c
+  ../vmm/nested/nested_util.c
+  ../vmm/asm/vmx_asm.asm
+  ../vmm/asm/exit_stub.asm
+
+[Packages]
+  MdePkg/MdePkg.dec
+
+[LibraryClasses]
+  UefiApplicationEntryPoint
+  UefiLib
+  UefiBootServicesTableLib
+  BaseLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  PrintLib
+  DebugLib
+
+[Protocols]
+  gEfiLoadedImageProtocolGuid
+  gEfiSimpleFileSystemProtocolGuid
+
+[Guids]
+  gEfiFileInfoGuid
+
+[BuildOptions]
+  # MSVC: freestanding, MASM for asm stubs
+  MSFT:*_*_X64_CC_FLAGS  = /GS- /Oi- /GL- /wd4210 /wd4214 /wd4054 /wd4055 /wd4152
+  MSFT:*_*_X64_ASM_FLAGS = /nologo /c /Cx
+  # GCC: freestanding (ASM files are MASM — GCC builds require NASM conversion)
+  GCC:*_*_X64_CC_FLAGS   = -ffreestanding -mno-red-zone
+  *_*_X64_NASM_FLAGS     = -f win64
