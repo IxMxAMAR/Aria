@@ -11,9 +11,19 @@
 #include "../vmm/vmm.h"
 #include "../vmm/vmcs.h"
 #include "../vmm/ept.h"
-#include "../vmm/anti_detect.h"
-#include "../vmm/nested/nested_vmx.h"
 #include "../shared/protocol.h"
+
+// ---------------------------------------------------------------------------
+// Nested VMX (Phase 2). The engine under vmm/nested/ is not yet wired into the
+// exit dispatcher and depends on vmm/mem_engine.h, which does not exist. Until
+// that work lands, it is compiled out so the core hypervisor can build and boot.
+// Flip to 1 once handle_nested_vmx is reachable from vmm_handle_exit.
+// ---------------------------------------------------------------------------
+#define ARIA_ENABLE_NESTED 0
+
+#if ARIA_ENABLE_NESTED
+#include "../vmm/nested/nested_vmx.h"
+#endif
 
 static UINT64 get_max_physical_address(void) {
     // Use CPUID to get the physical address width — this covers ALL memory
@@ -210,6 +220,7 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     g_vmm.vmm_base_pa = g_vmm.vmxon_region_pa;
     g_vmm.vmm_size = 0x1000000;
 
+#if ARIA_ENABLE_NESTED
     // Allocate nested VMX state
     log_write("[*] Allocating nested VMX state...\n");
     {
@@ -287,10 +298,9 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         serial_print("\n");
     }
 
-    con_print(L"[+] Memory allocated\r\n");
+#endif // ARIA_ENABLE_NESTED
 
-    anti_detect_init(&g_vmm);
-    con_print(L"[+] Anti-detect initialized\r\n");
+    con_print(L"[+] Memory allocated\r\n");
 
     UINT64 max_phys = get_max_physical_address(); (void)max_phys;
     con_print(L"[*] Building EPT (1GB+MTRR)...\r\n");

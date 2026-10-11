@@ -14,27 +14,16 @@
   ../vmm/vmm.c
   ../vmm/vmcs.c
   ../vmm/ept.c
-  ../vmm/exit_handlers/cpuid.c
-  ../vmm/exit_handlers/ept_violation.c
   ../vmm/exit_handlers/msr.c
   ../vmm/exit_handlers/cr_access.c
-  ../vmm/nested/nested_vmx.c
-  ../vmm/nested/vm_entry.c
-  ../vmm/nested/exit_dispatch.c
-  ../vmm/nested/exit_reflect.c
-  ../vmm/nested/vmcs_merge.c
-  ../vmm/nested/vmcs_shadow.c
-  ../vmm/nested/shadow_ept.c
-  ../vmm/nested/shadow_ept_walk.c
-  ../vmm/nested/eptp_switch.c
-  ../vmm/nested/hv_interface.c
-  ../vmm/nested/vpid_mgr.c
-  ../vmm/nested/interrupt_nested.c
-  ../vmm/nested/preempt_timer.c
-  ../vmm/nested/cr_nested.c
-  ../vmm/nested/nested_util.c
   ../vmm/asm/vmx_asm.asm
   ../vmm/asm/exit_stub.asm
+
+# Not built (Phase 2 — see docs/STATUS.md):
+#   vmm/nested/*.c                  not wired into the exit dispatcher; needs vmm/mem_engine.h
+#   exit_handlers/cpuid.c           unreachable duplicate of vmm.c's handler; needs vmm/channel.h
+#   exit_handlers/ept_violation.c   unreachable duplicate of vmm.c's handler; needs vmm/channel.h
+# The sources remain on disk and are re-enabled via ARIA_ENABLE_NESTED.
 
 [Packages]
   MdePkg/MdePkg.dec
@@ -48,6 +37,12 @@
   MemoryAllocationLib
   PrintLib
   DebugLib
+  # The MdePkg libraries linked into this module are compiled with /GS (EDK2's
+  # toolchain default), so they reference __security_check_cookie and
+  # __report_rangecheckfailure. These two classes supply those symbols. Without
+  # them the link fails with LNK2001 unresolved externals.
+  StackCheckLib
+  StackCheckFailureHookLib
 
 [Protocols]
   gEfiLoadedImageProtocolGuid
@@ -57,9 +52,6 @@
   gEfiFileInfoGuid
 
 [BuildOptions]
-  # MSVC: freestanding, MASM for asm stubs
+  # MSVC: freestanding, MASM for the asm stubs
   MSFT:*_*_X64_CC_FLAGS  = /GS- /Oi- /GL- /wd4210 /wd4214 /wd4054 /wd4055 /wd4152
   MSFT:*_*_X64_ASM_FLAGS = /nologo /c /Cx
-  # GCC: freestanding (ASM files are MASM — GCC builds require NASM conversion)
-  GCC:*_*_X64_CC_FLAGS   = -ffreestanding -mno-red-zone
-  *_*_X64_NASM_FLAGS     = -f win64

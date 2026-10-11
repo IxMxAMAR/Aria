@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  edk2-build:
+    # windows-latest ships Visual Studio with the C++ toolset, which supplies
+    # cl.exe and ml64.exe (the MASM assembler the VMX stubs need).
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Aria
+        uses: actions/checkout@v4
+        with:
+          path: Aria
+
+      - name: Checkout EDK2
+        uses: actions/checkout@v4
+        with:
+          repository: tianocore/edk2
+          ref: edk2-stable202411
+          path: edk2
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install edk2-basetools
+        run: python -m pip install edk2-basetools
+
+      - name: Expose Aria as the AriaPkg package
+        shell: cmd
+        run: mklink /J "%GITHUB_WORKSPACE%\edk2\AriaPkg" "%GITHUB_WORKSPACE%\Aria"
+
+      - name: Build AriaEfi.efi
+        shell: cmd
+        working-directory: edk2
+        run: |
+          call edksetup.bat Reconfig
+          if errorlevel 1 exit /b 1
+          build -a X64 -t VS2022 -b RELEASE -p AriaPkg/efi/AriaPkg.dsc
+          if errorlevel 1 exit /b 1
+
+      - name: Upload AriaEfi.efi
+        uses: actions/upload-artifact@v4
+        with:
+          name: AriaEfi
+          path: edk2/Build/Aria/RELEASE_VS2022/X64/AriaEfi.efi
+          if-no-files-found: error

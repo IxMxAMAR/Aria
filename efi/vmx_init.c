@@ -263,34 +263,28 @@ VMX_STATUS vmx_setup_vmcs(VMM_STATE* state) {
     // Bit 21: Load IA32_EFER    |
     // Strip: PERF(12), CET(28), PKRS(29)
     // ================================================================
-    // Exit: HostAddr(9) + SaveEFER(20) + LoadEFER(21) ONLY.
-    // NO PAT save/load — let guest keep firmware's PAT unchanged.
+    // Exit: HostAddr(9) + SaveEFER(20) + LoadEFER(21).
+    // PAT is deliberately neither saved nor loaded, so it passes through
+    // untouched (entry does not load it either — see the entry-controls note).
     uint32_t exit_ctrls = vmx_adjust_controls(
         0x00000200 | 0x00100000 | 0x00200000,
         IA32_VMX_TRUE_EXIT
     );
-    {
-        uint64_t exit_msr = __readmsr(IA32_VMX_TRUE_EXIT);
-        uint32_t must1 = (uint32_t)(exit_msr & 0xFFFFFFFF);
-        if (!(must1 & (1u << 12))) exit_ctrls &= ~(1u << 12); // PERF
-        if (!(must1 & (1u << 28))) exit_ctrls &= ~(1u << 28); // CET
-        if (!(must1 & (1u << 29))) exit_ctrls &= ~(1u << 29); // PKRS
-    }
     vmcs_write32(VMCS_VM_EXIT_CTRLS, exit_ctrls);
 
     // ================================================================
     // ENTRY CONTROLS
-    // Entry: IA-32e(9) + LoadEFER(14) ONLY. NO LoadPAT.
+    // Bit 9:  IA-32e mode guest
+    // Bit 15: Load IA32_EFER
+    // (Bit 14 is Load IA32_PAT — the previous value here — which left
+    //  VMCS_GUEST_IA32_EFER inert and reverted every guest WRMSR to EFER.)
+    // vmx_adjust_controls() already reconciles the must-be-1/may-be-1 bits
+    // from the capability MSR, so no additional masking is needed.
+    // ================================================================
     uint32_t entry_ctrls = vmx_adjust_controls(
-        0x00000200 | 0x00004000,
+        0x00000200 | 0x00008000,
         IA32_VMX_TRUE_ENTRY
     );
-    {
-        uint64_t entry_msr = __readmsr(IA32_VMX_TRUE_ENTRY);
-        uint32_t must1 = (uint32_t)(entry_msr & 0xFFFFFFFF);
-        if (!(must1 & (1u << 15))) entry_ctrls &= ~(1u << 15); // PERF
-        if (!(must1 & (1u << 20))) entry_ctrls &= ~(1u << 20); // CET
-    }
     vmcs_write32(VMCS_VM_ENTRY_CTRLS, entry_ctrls);
 
     vmcs_write16(VMCS_VPID, 1);
@@ -383,12 +377,16 @@ VMX_STATUS vmx_setup_vmcs(VMM_STATE* state) {
     vmcs_write64(VMCS_GUEST_CR3, __readcr3());
     vmcs_write64(VMCS_GUEST_CR4, __readcr4());
     vmcs_write64(VMCS_CR0_READ_SHADOW, __readcr0());
-    vmcs_write64(VMCS_CR4_READ_SHADOW, __readcr4());
+    // The guest must not see CR4.VMXE: that bit belongs to the host, and the
+    // mask below makes any guest attempt to change it exit.
+    vmcs_write64(VMCS_CR4_READ_SHADOW, __readcr4() & ~((uint64_t)CR4_VMXE));
     vmcs_write64(VMCS_CR4_GUEST_HOST_MASK, CR4_VMXE);
 
-    #define STANDARD_PAT 0x0007040600070406ULL
     vmcs_write64(VMCS_GUEST_IA32_DEBUGCTL, __readmsr(IA32_DEBUGCTL));
-    vmcs_write64(VMCS_GUEST_IA32_PAT, STANDARD_PAT);
+    // PAT is not loaded on entry (entry control bit 14 is clear), so this field
+    // is currently inert. Write the live value rather than a hardcoded constant
+    // so it cannot silently disagree with the CPU if PAT loading is enabled.
+    vmcs_write64(VMCS_GUEST_IA32_PAT, __readmsr(IA32_PAT));
     vmcs_write64(VMCS_GUEST_IA32_EFER, __readmsr(IA32_EFER));
     vmcs_write32(VMCS_GUEST_SYSENTER_CS, (uint32_t)__readmsr(IA32_SYSENTER_CS));
     vmcs_write64(VMCS_GUEST_SYSENTER_ESP, __readmsr(IA32_SYSENTER_ESP));
@@ -424,11 +422,12 @@ VMX_STATUS vmx_setup_vmcs(VMM_STATE* state) {
     vmcs_write64(VMCS_HOST_GDTR_BASE, gdtr.base);
     vmcs_write64(VMCS_HOST_IDTR_BASE, idtr.base);
 
-    // ALWAYS write PAT and EFER — Alder Lake validates these unconditionally
-    // even when "Load" bits are off (undocumented but confirmed on real hardware).
-    // PAT: use hardcoded standard value to avoid firmware garbage in MSR 0x277.
-    // EFER: read from MSR (must have LMA=1 to match host-addr-size=1).
-    vmcs_write64(VMCS_HOST_IA32_PAT, STANDARD_PAT);
+    // These host fields are only loaded on VM exit when the matching exit
+    // control bit is set. PAT is not loaded in this build (exit control bit 19
+    // is clear), so the PAT field below is inert; it holds the live value so it
+    // cannot drift if PAT loading is enabled later. EFER *is* loaded (bit 21)
+    // and must have LMA=1 to match host-address-space-size=1.
+    vmcs_write64(VMCS_HOST_IA32_PAT, __readmsr(IA32_PAT));
     vmcs_write64(VMCS_HOST_IA32_EFER, __readmsr(IA32_EFER));
     vmcs_write32(VMCS_HOST_SYSENTER_CS, (uint32_t)__readmsr(IA32_SYSENTER_CS));
     vmcs_write64(VMCS_HOST_SYSENTER_ESP, __readmsr(IA32_SYSENTER_ESP));
@@ -450,7 +449,7 @@ VMX_STATUS vmx_setup_vmcs(VMM_STATE* state) {
         if (fxc>0) m|=((1ULL<<fxc)-1)<<32;
         vmcs_write64(VMCS_HOST_IA32_PERF_GLOBAL, __readmsr(IA32_PERF_GLOBAL_CTRL)&m);
     }
-    if (entry_ctrls & (1u << 15)) {
+    if (entry_ctrls & (1u << 13)) {
         int pi[4]; __cpuid(pi, 0x0A);
         uint32_t gpc=(pi[0]>>8)&0xFF, fxc=pi[3]&0x1F;
         uint64_t m=0;
