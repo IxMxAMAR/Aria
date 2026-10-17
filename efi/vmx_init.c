@@ -618,6 +618,13 @@ VMX_STATUS vmx_launch(VMM_STATE* state) {
     extern void log_write(const char*);
     log_write("[L] vmx_launch entered\n");
 
+    // Cross-check the host state against the SDM 26.2 rules now, so a violation
+    // shows up as a specific message instead of an opaque VM-entry failure.
+    // Report-only: this build has not been run on hardware yet, and a validator
+    // false positive must not be able to block a launch that would otherwise
+    // work. Read the error count together with the VM-instruction error below.
+    vmcs_validate_host_state();
+
     extern int vmx_do_launch(VMM_STATE* state);
     log_write("[L] calling vmx_do_launch\n");
     int result = vmx_do_launch(state);

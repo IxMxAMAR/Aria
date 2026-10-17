@@ -144,3 +144,48 @@ byte-identical image.
 
 **Aria has never been run.** Every claim above is build-level only. No part of
 this document reflects an actual `VMLAUNCH` on hardware.
+
+## Code audit
+
+The VMCS layer was audited against the Intel SDM rather than assumed correct.
+
+### Verified correct
+
+- All VMCS field encodings in `vmm/vmcs.h` (~100 constants) match the SDM
+  scheme: width in bits 14:13, access type in 11:10, index in 9:1. Includes the
+  easy-to-miss ones — `VMCS_LINK_PTR` at 0x2800 as 64-bit *guest* state,
+  `GUEST_PHYS_ADDR` at 0x2400, the reserved gap at 0x482C correctly skipped
+  before `PREEMPT_TIMER` at 0x482E, and the CET fields at 0x6828/0x6C18.
+- Exit-reason constants 0-64 match the SDM.
+- `read_segment_descriptor()` handles null selectors and not-present
+  descriptors: both yield access rights 0x10000 (unusable), which is what SDM
+  26.3.1.2 requires. Without it, UEFI's common P=0 DS/ES/FS/GS would fail VM
+  entry with error 33. The extraction `(raw >> 40) & 0xF0FF` matches the VMCS
+  access-rights layout exactly.
+- `vmx_adjust_controls()` uses the CR0_FIXED0/FIXED1 convention
+  `(desired | must_be_1) & may_be_1`, which is correct.
+- The control set is coherent: proc-based bit 28 (use MSR bitmaps) is enabled
+  and `VMCS_MSR_BITMAP` is programmed; the bitmap is all zeros, so MSRs pass
+  through and no MSR exits occur. Secondary controls enable EPT and VPID.
+  Pin-based requests no external-interrupt or NMI exiting, so the guest keeps
+  its own interrupts.
+- `VMCS_VMCS_LINK_PTR` is 0xFFFFFFFFFFFFFFFF, required when VMCS shadowing is
+  off.
+
+### Fixed in this pass
+
+- `vmcs_validate_host_state()` was dead code — 95 lines of SDM 26.2 host-state
+  checks that nothing called. It now runs at the top of `vmx_launch()`, so a
+  host-state violation prints a specific message before the launch attempt. It
+  is deliberately report-only: the build has not been run on hardware, and a
+  validator false positive must not be able to block a launch that would
+  otherwise work.
+- The VM-instruction error table printed on launch failure mislabelled codes 7
+  and 8 (they are VMREAD/VMWRITE errors, not control/host-state errors),
+  invented a meaning for 9, and omitted 28 and 29 — the two codes a broken
+  VMLAUNCH actually returns. It now matches SDM Vol 3C Table 30-1.
+
+### Not audited
+
+`ept_init.c` beyond the identity-map construction and MTRR typing, and the
+assembly beyond the register-save order against `GUEST_REGS`.

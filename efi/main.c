@@ -462,13 +462,17 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         err_msg[++pos] = L'\r'; err_msg[++pos] = L'\n'; err_msg[++pos] = L'\0';
         con_print(L"[!] VMLAUNCH FAILED\r\n");
         con_print(err_msg);
-        // Print what each error means
-        if (vm_err == 7) con_print(L"  = Invalid VM-execution control fields\r\n");
-        else if (vm_err == 8) con_print(L"  = Invalid host-state field\r\n");
-        else if (vm_err == 9) con_print(L"  = VMPTRLD with invalid PA\r\n");
-        else if (vm_err == 33) con_print(L"  = Invalid guest state (entry)\r\n");
-        else if (vm_err == 34) con_print(L"  = VM entry failure due to MSR loading\r\n");
+        // SDM Vol 3C Table 30-1. These are the codes a VMLAUNCH can return.
+        // (Codes 7 and 8 previously carried meanings that belong to other
+        // numbers entirely, and 28/29 — the two most likely launch failures —
+        // were missing, which sent the reader after the wrong fault.)
+        if      (vm_err == 7)  con_print(L"  = VMREAD/VMWRITE from/to unsupported VMCS component\r\n");
+        else if (vm_err == 8)  con_print(L"  = VMWRITE to read-only VMCS component\r\n");
         else if (vm_err == 26) con_print(L"  = VMRESUME with non-launched VMCS\r\n");
+        else if (vm_err == 28) con_print(L"  = VM entry with invalid control field(s)\r\n");
+        else if (vm_err == 29) con_print(L"  = VM entry with invalid host-state field(s)\r\n");
+        else if (vm_err == 33) con_print(L"  = VM entry with invalid guest-state field(s)\r\n");
+        else if (vm_err == 34) con_print(L"  = VM entry failure due to MSR loading\r\n");
         else con_print(L"  (see Intel SDM Vol 3C Table 30-1)\r\n");
         log_close();
         gBS->Stall(30000000); // 30 seconds to read
