@@ -84,4 +84,12 @@ tell it is virtualised, which is the honest design and the one worth building.
 ## Progress
 
 - Item 1 — surviving `ExitBootServices` — is implemented in `efi/loader.c`.
-  Build-verified only; not yet observed on hardware. See `docs/STATUS.md`.
+  Build-verified only; not yet observed on hardware. See `docs/STATUS.md`.- Item 4 (TSC offsetting) is implemented: processor-based control bit 3 plus
+  per-exit accounting in `vmm_handle_exit`. Build-verified only.
+- Fatal exits now dump reason, qualification, RIP, RSP, GPA and exit count to VGA
+  as well as serial, because a desktop with no serial has only the screen.
+- Item 2 (AP virtualisation) is deliberately not started yet. `vmx_do_launch`
+  writes GUEST_RSP/GUEST_RIP from the live context and `vmx_launch` already takes
+  a `VMM_STATE*`, so AP bring-up is mechanically straightforward - but it is the
+  single most likely thing to hang a machine on first boot, and stacking it on an
+  entirely unverified base makes a first hardware failure impossible to isolate.

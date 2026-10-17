@@ -198,7 +198,8 @@ extern VMM_STATE g_vmm;
 #define ARIA_HC_EXIT_REASON  2
 #define ARIA_HC_EPT_TYPING   3
 #define ARIA_HC_FINALIZE     4
-#define ARIA_HC_MAX          ARIA_HC_FINALIZE
+#define ARIA_HC_TSC_OFFSET   5
+#define ARIA_HC_MAX          ARIA_HC_TSC_OFFSET
 
 void vmm_handle_exit(GUEST_REGS* regs);
 

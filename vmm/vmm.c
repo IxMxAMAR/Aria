@@ -3,6 +3,7 @@
 #include "vmcs.h"
 #include "../efi/serial.h"
 #include "../shared/protocol.h"
+#include <Library/BaseLib.h>   // AsmReadTsc
 
 VMM_STATE g_vmm = {0};
 
@@ -81,6 +82,18 @@ static void vga_puts(const char* s) {
     }
 }
 
+// Write a hex value plus a newline to the VGA text buffer. A hang has to be
+// readable from the screen alone, because a desktop may have no serial port.
+static void vga_hex(uint64_t v) {
+    static const char digits[] = "0123456789ABCDEF";
+    char buf[19];
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 0; i < 16; i++) buf[2 + i] = digits[(v >> ((15 - i) * 4)) & 0xF];
+    buf[18] = '\0';
+    vga_puts(buf);
+    vga_puts("\n");
+}
+
 static void halt_forever(void) {
     for (;;) { extern void _mm_pause(void); _mm_pause(); }
 }
@@ -92,6 +105,50 @@ volatile uint32_t aria_exit_log[16] = {0};
 // Per-reason exit counters, indexed by VM-exit reason 0-64. The log above shows
 // ordering; these show frequency, and the guest reads them via hypercall 2.
 volatile uint64_t aria_exit_reason_counts[65] = {0};
+
+// Accumulated time the guest did not spend running. VMCS_TSC_OFFSET is added to
+// the host TSC to produce the guest's TSC, so subtracting the time spent in the
+// hypervisor keeps guest time monotonic and free of exit latency.
+static int64_t aria_tsc_offset = 0;
+
+// Dump everything needed to diagnose a fatal exit, to both channels. Serial is
+// richer, but the VGA copy is the one that survives a machine with no serial.
+static void panic_dump(const char* tag) {
+    uint32_t reason = vmcs_read32(VMCS_EXIT_REASON) & 0xFFFF;
+    uint64_t qual   = vmcs_read64(VMCS_EXIT_QUALIFICATION);
+    uint64_t rip    = vmcs_read64(VMCS_GUEST_RIP);
+    uint64_t rsp    = vmcs_read64(VMCS_GUEST_RSP);
+    uint64_t gpa    = vmcs_read64(VMCS_GUEST_PHYS_ADDR);
+
+    serial_print("[!] ");
+    serial_print(tag);
+    serial_print(" reason=");
+    serial_print_dec(reason);
+    serial_print(" qual=");
+    serial_print_hex(qual);
+    serial_print(" RIP=");
+    serial_print_hex(rip);
+    serial_print(" RSP=");
+    serial_print_hex(rsp);
+    serial_print(" GPA=");
+    serial_print_hex(gpa);
+    serial_print("\n");
+
+    vga_puts("\n[Aria] ");
+    vga_puts(tag);
+    vga_puts("\n reason ");
+    vga_hex(reason);
+    vga_puts(" qual ");
+    vga_hex(qual);
+    vga_puts(" RIP ");
+    vga_hex(rip);
+    vga_puts(" RSP ");
+    vga_hex(rsp);
+    vga_puts(" GPA ");
+    vga_hex(gpa);
+    vga_puts(" exits ");
+    vga_hex((uint64_t)aria_exit_count);
+}
 
 // ---------------------------------------------------------------------------
 // Hypercall ABI (guest -> hypervisor)
@@ -129,6 +186,9 @@ static void handle_hypercall(GUEST_REGS* regs) {
         regs->rbx = g_vmm.ept_wb_pages;
         regs->rcx = g_vmm.ept_uc_pages;
         break;
+    case ARIA_HC_TSC_OFFSET:
+        regs->rbx = (uint64_t)aria_tsc_offset;
+        break;
     case ARIA_HC_FINALIZE:
         // Relocate the image and repoint the VMCS host state. Issued by the
         // ExitBootServices hook, which runs as the guest and so cannot VMWRITE
@@ -142,6 +202,7 @@ static void handle_hypercall(GUEST_REGS* regs) {
 }
 
 void vmm_handle_exit(GUEST_REGS* regs) {
+    uint64_t tsc_in = AsmReadTsc();
     uint32_t exit_reason = vmcs_read32(VMCS_EXIT_REASON) & 0xFFFF;
 
     // Log exit reason
@@ -190,7 +251,8 @@ void vmm_handle_exit(GUEST_REGS* regs) {
             regs->rbx = (1u << 0)             // VMCALL hypercalls
                       | (1u << 1)             // exit statistics
                       | (1u << 2)             // EPT memory-typing report
-                      | (1u << 3);            // MSR write interception
+                      | (1u << 3)             // MSR write interception
+                      | (1u << 4);            // TSC offsetting
             regs->rcx = ARIA_HC_MAX;          // highest hypercall implemented
             regs->rdx = 0;
             advance_guest_rip();
@@ -306,50 +368,41 @@ void vmm_handle_exit(GUEST_REGS* regs) {
 
     // --- Fatal guest conditions ------------------------------------------------
     case EXIT_REASON_TRIPLE_FAULT: // 2
-        serial_print("[!] TRIPLE FAULT in guest at RIP=");
-        serial_print_hex(vmcs_read64(VMCS_GUEST_RIP));
-        serial_print("\n");
-        vga_puts("[Aria] guest triple fault");
+        panic_dump("guest triple fault");
         halt_forever();
         break;
 
     case EXIT_REASON_EPT_VIOLATION: // 48
         // Should not happen while the EPT is a full identity map. If it does, the
         // EPT is inconsistent and continuing would corrupt the guest silently.
-        serial_print("[!] EPT violation GPA=");
-        serial_print_hex(vmcs_read64(VMCS_GUEST_PHYS_ADDR));
-        serial_print(" RIP=");
-        serial_print_hex(vmcs_read64(VMCS_GUEST_RIP));
-        serial_print("\n");
-        vga_puts("[Aria] unexpected EPT violation");
+        panic_dump("EPT violation");
         halt_forever();
         break;
 
     case EXIT_REASON_EPT_MISCONFIG: // 49
-        serial_print("[!] EPT MISCONFIG at GPA ");
-        serial_print_hex(vmcs_read64(VMCS_GUEST_PHYS_ADDR));
-        serial_print("\n");
-        vga_puts("[Aria] EPT misconfiguration");
+        panic_dump("EPT misconfiguration");
         halt_forever();
         break;
 
     default:
+#if ARIA_STRICT_EXITS
+        panic_dump("unhandled VM exit");
+        halt_forever();
+#else
         serial_print("[!] Unhandled exit reason ");
         serial_print_dec(exit_reason);
         serial_print(" RIP=");
         serial_print_hex(vmcs_read64(VMCS_GUEST_RIP));
-        serial_print(" qual=");
-        serial_print_hex(vmcs_read64(VMCS_EXIT_QUALIFICATION));
         serial_print("\n");
-#if ARIA_STRICT_EXITS
-        vga_puts("[Aria] unhandled VM exit - see serial");
-        halt_forever();
-#else
         // Debug only: skipping is correct for instruction-caused exits and wrong
         // for event-caused ones, where VM_EXIT_INSN_LEN is undefined.
         advance_guest_rip();
 #endif
         break;
     }
-    return;
+
+    // Charge the time spent here to the hypervisor rather than to the guest: the
+    // next VM entry picks up the new offset from the VMCS.
+    aria_tsc_offset -= (int64_t)(AsmReadTsc() - tsc_in);
+    vmcs_write64(VMCS_TSC_OFFSET, (uint64_t)aria_tsc_offset);
 }

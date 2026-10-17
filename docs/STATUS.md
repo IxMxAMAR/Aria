@@ -299,3 +299,22 @@ The host stack is allocated below 4GB, because the host identity map covers
 things: that the image really is position independent at a nonzero base; that the
 host CR3 and GDT are accepted on the first exit after the handoff; and that no
 relocated path touches `gBS`/`gST`, which are freed at that point.
+### TSC offsetting — implemented, unverified
+
+The processor-based control "use TSC offsetting" (bit 3) is now enabled and
+`vmm_handle_exit` charges the time it spends in root context to the hypervisor:
+`VMCS_TSC_OFFSET` accumulates `-(tsc_out - tsc_in)`, so the guest's `RDTSC` does
+not advance while the guest is not running. The accumulated value is readable
+through hypercall 5 (`TSC_OFFSET`).
+
+`vmx_adjust_controls` masks bit 3 off if `IA32_VMX_PROCBASED_CTLS` does not
+allow it, in which case the offset writes are harmless no-ops.
+
+### Readable panics
+
+The four fatal paths (triple fault, EPT violation, EPT misconfiguration,
+unhandled exit) previously logged detail to serial and only a short string to
+VGA. A desktop usually has no serial port, so they now dump exit reason,
+qualification, guest `RIP`, `RSP`, `GPA` and the exit count to the VGA text
+buffer as well, and halt. This is the intended way to find out what went wrong on
+a first hardware run.

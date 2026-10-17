@@ -242,7 +242,7 @@ VMX_STATUS vmx_setup_vmcs(VMM_STATE* state) {
 
     // Proc-based: MSR bitmap (bit 28) + secondary controls (bit 31)
     uint32_t procbased = vmx_adjust_controls(
-        0x10000000 | 0x80000000,
+        0x10000000 | 0x80000000 | 0x00000008,
         IA32_VMX_TRUE_PROCBASED
     );
     vmcs_write32(VMCS_PROC_BASED_EXEC_CTRL, procbased);
