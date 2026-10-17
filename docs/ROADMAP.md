@@ -99,4 +99,8 @@ tell it is virtualised, which is the honest design and the one worth building.
 - Item 2 (AP virtualisation) is blocked on a loader refactor, not on the MP
   protocol: an AP needs the relocated image to be valid at launch time, so the
   image has to be snapshotted at the end of setup as well as at the handoff, and
-  the host state applied per-VMCS. See `docs/STATUS.md`.
+  the host state applied per-VMCS. See `docs/STATUS.md`.- Item 2 (AP virtualisation) is implemented in `efi/smp.c`, together with the
+  loader refactor it required: the image is snapshotted at the end of setup as well
+  as at the handoff, and host state is applied per-VMCS. Build-verified only. This
+  is the riskiest component in the tree and the first thing to disable if a first
+  boot hangs.

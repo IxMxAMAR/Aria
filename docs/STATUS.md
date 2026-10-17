@@ -373,3 +373,32 @@ clear those entries are now omitted with a loud message instead of being emitted
 as an EPT misconfiguration, and memory above 4GB is left unmapped. That is a
 degraded state, not a good one, but it is honest and diagnosable; every CPU with
 EPT in practice supports 1GB pages.
+### AP virtualisation — implemented, unverified
+
+`efi/smp.c` locates `EFI_MP_SERVICES_PROTOCOL`, allocates a private VMXON region,
+VMCS and host stack for each AP, and runs a start-up procedure on every AP that
+does `vmx_enable` + `vmx_setup_vmcs` + `aria_loader_apply_host_state` +
+`vmx_do_launch` on itself. Each AP keeps executing firmware code but is a guest
+from that point on. Every AP inherits the BSP EPT, EPTP, MSR bitmap and control
+settings through a `CopyMem` of `VMM_STATE`, so all processors share one EPT.
+
+APs are launched before the BSP, so a failure is reported while the machine is
+still in a known state.
+
+Two things made this possible, and both were prerequisites rather than plumbing:
+
+- The host state had to be installed at launch time, not at the handoff. An AP
+  VMCS must point at the relocated image, but that image only became valid at
+  `ExitBootServices`; and once an AP has launched it cannot repair its own VMCS,
+  because the only correct host state is the one that would already be too late to
+  install. `aria_loader_snapshot()` is now called at the end of setup as well as at
+  the handoff, and `aria_loader_apply_host_state()` takes a `VMM_STATE*` so it can
+  be applied per-VMCS.
+- The launch does not go through `vmx_launch()`, which writes to the UEFI console
+  and is not safe to call concurrently from several APs. The AP procedure calls
+  `vmx_do_launch()` directly and reports on serial.
+
+**Unverified, and the riskiest thing in the tree.** `StartupAllAPs` is called with
+a zero timeout; console output is avoided but not proven safe; and an AP returning
+to the firmware MP dispatch code *as a guest* has never been observed. If a first
+hardware run hangs, disabling this is the first thing to try.

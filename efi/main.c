@@ -8,6 +8,7 @@
 #include "vmx_init.h"
 #include "ept_init.h"
 #include "loader.h"
+#include "smp.h"
 #include "serial.h"
 #include "../vmm/vmm.h"
 #include "../vmm/vmcs.h"
@@ -479,6 +480,18 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     if (g_loader.host_idt_base)
         ept_hide_range(&g_vmm, g_loader.host_idt_base, PAGE_SIZE);
     log_write("[+] hypervisor memory protected in the EPT\n");
+
+    // Install the runtime host state now rather than at the handoff. Each AP
+    // VMCS has to point at the relocated image before that AP launches, and an
+    // AP cannot repair its own VMCS afterwards: the only correct host state is
+    // the one that would already be too late to install.
+    aria_loader_snapshot();
+    aria_loader_apply_host_state(&g_vmm);
+
+    // Bring up VMX on every AP before the BSP launches, so a failure here is
+    // reported while the machine is still in a known state.
+    aria_smp_init();
+    aria_smp_launch_aps();
 
     // Log right before VMLAUNCH so we know we got here
     log_write("[*] About to call vmx_launch\n");

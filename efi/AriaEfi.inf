@@ -11,6 +11,7 @@
   vmx_init.c
   ept_init.c
   loader.c
+  smp.c
   serial.c
   ../vmm/vmm.c
   ../vmm/vmcs.c
@@ -48,6 +49,7 @@
 
 [Protocols]
   gEfiLoadedImageProtocolGuid
+  gEfiMpServiceProtocolGuid
   gEfiSimpleFileSystemProtocolGuid
 
 [Guids]

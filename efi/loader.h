@@ -31,6 +31,16 @@ EFI_STATUS aria_loader_prepare(void);
 // VMCS itself (VMWRITE is not available in non-root operation).
 EFI_STATUS aria_loader_hook_exit_boot_services(void);
 
-// Root-side: copy the live image into the runtime buffer and repoint the VMCS
-// host state at it. Called from the VM-exit handler in response to hypercall 4.
+// Copy the live image into the runtime buffer. Safe to call repeatedly: once at
+// the end of setup so the relocated stub is valid from launch time, and again at
+// the handoff so the copy sees the final globals.
+void aria_loader_snapshot(void);
+
+// Point one VMCS's host state at the runtime copy and the runtime tables. Must
+// run on the processor that owns the VMCS, with that VMCS current.
+struct _VMM_STATE;
+void aria_loader_apply_host_state(struct _VMM_STATE* state);
+
+// Root-side: refresh the runtime image with the final globals. Called from the
+// VM-exit handler in response to hypercall 4.
 void aria_loader_finalize(void);

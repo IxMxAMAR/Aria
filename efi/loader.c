@@ -167,31 +167,48 @@ EFI_STATUS aria_loader_prepare(void) {
     return EFI_SUCCESS;
 }
 
-// Runs in root context (hypercall 4). Idempotent: the flag is set before the
-// copy so the relocated copy also reports itself as finalised.
-void aria_loader_finalize(void) {
-    if (g_loader.finalized) return;
+// Copy the live image into the runtime buffer. Safe to call more than once: the
+// end of setup calls it so the relocated stub is valid from launch time, and the
+// handoff calls it again so the copy sees the final globals.
+void aria_loader_snapshot(void) {
     if (!g_loader.prepared || g_loader.image_new_base == 0) return;
-    g_loader.finalized = TRUE;
-
-    // Copy the live image, including current .data/.bss, so the relocated copy
-    // sees the state that was actually set up (EPT pointers, VMCS PA, and so
-    // on). Those are absolute runtime values, not image-relative, so they stay
-    // correct without relocation.
     UINT8* dst = (UINT8*)(UINTN)g_loader.image_new_base;
     const UINT8* src = (const UINT8*)(UINTN)g_loader.image_old_base;
     for (UINT64 i = 0; i < g_loader.image_size; i++) {
         dst[i] = src[i];
     }
+}
+
+// Point one VMCS's host state at the runtime copy and the runtime tables.
+// Must run on the processor that owns the VMCS, with that VMCS current, so it is
+// called for the BSP after vmx_setup_vmcs and for each AP inside its own
+// start-up procedure. Absolute runtime values stored in the image (EPT pointers,
+// VMCS physical addresses) are not image-relative, so copying the image does not
+// disturb them.
+void aria_loader_apply_host_state(VMM_STATE* state) {
+    if (!g_loader.prepared || state == NULL) return;
 
     vmcs_write64(VMCS_HOST_RIP, (UINT64)(UINTN)vm_exit_stub + g_loader.delta);
+    vmcs_write64(VMCS_HOST_RSP, (UINT64)(UINTN)state->host_stack + 0x10000);
     vmcs_write64(VMCS_HOST_CR3, g_loader.host_cr3_pa);
     vmcs_write64(VMCS_HOST_GDTR_BASE, g_loader.host_gdt_base);
     vmcs_write64(VMCS_HOST_IDTR_BASE, g_loader.host_idt_base);
     vmcs_write16(VMCS_HOST_TR_SEL, g_loader.host_tr_sel);
     vmcs_write64(VMCS_HOST_TR_BASE, g_loader.host_tr_base);
+}
 
-    serial_print("[+] loader: host state moved to runtime memory, RIP=0x");
+// Runs in root context (hypercall 4). The host state was already installed at
+// launch, so all this has to do is refresh the image with the final globals.
+// Idempotent: the flag is set before the copy, so the relocated copy also
+// reports itself as finalised.
+void aria_loader_finalize(void) {
+    if (g_loader.finalized) return;
+    if (!g_loader.prepared || g_loader.image_new_base == 0) return;
+    g_loader.finalized = TRUE;
+
+    aria_loader_snapshot();
+
+    serial_print("[+] loader: runtime image refreshed, RIP=0x");
     serial_print_hex((UINT64)(UINTN)vm_exit_stub + g_loader.delta);
     serial_print("\n");
 }
