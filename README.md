@@ -81,3 +81,29 @@ management, both of which can stop the machine dead. Read
 ## License
 
 MIT â€” see [LICENSE](LICENSE).
+
+## Hypervisor interface
+
+Aria announces itself rather than trying to hide.
+
+| CPUID leaf | Returns |
+|---|---|
+| `0x40000000` | vendor `"AriaAriaAria"`, EAX = highest leaf |
+| `0x40000001` | EAX = ABI version, EBX = feature flags, ECX = highest hypercall |
+| `0x40000002` | live VM-exit counter (EDX:EAX) |
+
+The guest can issue `VMCALL` with the call number in RAX:
+
+| Call | Name | Returns |
+|---|---|---|
+| 0 | `VERSION` | RBX = ABI version, RCX = `"Aria"` |
+| 1 | `EXIT_COUNT` | RBX = total VM exits since launch |
+| 2 | `EXIT_REASON` | in RCX = reason, RBX = count for that reason |
+| 3 | `EPT_TYPING` | RBX = WB pages, RCX = UC pages |
+
+An unknown call returns RAX = 1.
+
+See [docs/STATUS.md](docs/STATUS.md) for what is implemented and what is not, and
+[docs/ROADMAP.md](docs/ROADMAP.md) for what comes next — the first item there is
+the one that matters: Aria's code image does not yet survive the guest calling
+`ExitBootServices`.
