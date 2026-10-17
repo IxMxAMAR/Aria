@@ -113,6 +113,23 @@ int ept_build_identity_map_minimal(VMM_STATE* state) {
     // Count the resulting types so a hardware run can confirm the MTRR default
     // was actually honoured: if system RAM is still coming out uncached, the WB
     // count prints as 0 and the typing is still wrong.
+    // Validate the EPT capabilities this mapping depends on. Building an EPT the
+    // CPU cannot walk produces an opaque VM-entry failure, so check first and say
+    // exactly what is missing instead.
+    uint64_t ept_cap = __readmsr(0x48C);   // IA32_VMX_EPT_VPID_CAP
+    serial_print("[*] EPT cap=");
+    serial_print_hex(ept_cap);
+    serial_print("\n");
+    if (!(ept_cap & (1ULL << 6)))  { serial_print("[!] EPT: 4-level walks unsupported\n"); return -1; }
+    if (!(ept_cap & (1ULL << 14))) { serial_print("[!] EPT: WB memory type unsupported\n"); return -1; }
+    if (!(ept_cap & (1ULL << 16))) { serial_print("[!] EPT: 2MB pages unsupported\n"); return -1; }
+    // 1GB pages are used for the 4-512GB window. Without them those entries would
+    // be an EPT misconfiguration, so drop them and say so rather than emit them.
+    int have_1gb = (ept_cap & (1ULL << 17)) != 0;
+    if (!have_1gb) {
+        serial_print("[!] EPT: 1GB pages unsupported - memory above 4GB unmapped\n");
+    }
+
     uint32_t wb_pages = 0, uc_pages = 0;
 
     for (int gi = 0; gi < 4; gi++) {
@@ -135,7 +152,7 @@ int ept_build_identity_map_minimal(VMM_STATE* state) {
     }
 
     // 4-512GB: 1GB pages — MTRR whitelist
-    for (int i = 4; i < 512; i++) {
+    for (int i = 4; i < 512 && have_1gb; i++) {
         uint64_t phys = (uint64_t)i << 30;
         uint64_t mt = 0; // UC default
         if (mtrr_is_wb(phys) && mtrr_is_wb(phys + 0x3FFFFFFF))

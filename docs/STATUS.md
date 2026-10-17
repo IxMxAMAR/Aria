@@ -360,3 +360,16 @@ The fix is to snapshot the image once at the end of setup as well as at the
 handoff, so the relocated stub is valid from launch time onward, and to apply the
 host state per-VMCS at AP launch instead of only to the BSP at handoff. That is a
 prerequisite refactor in `efi/loader.c` and has not been done.
+### EPT capability validation — implemented
+
+`ept_build_identity_map_minimal` now reads `IA32_VMX_EPT_VPID_CAP` (MSR 0x48C)
+before building and refuses with a named reason if the CPU cannot do 4-level EPT
+walks (bit 6), WB memory type (bit 14) or 2MB pages (bit 16). Previously the
+capability MSR was never read at all, so an unsupported configuration surfaced as
+an opaque VM-entry failure.
+
+The 4-512GB window is mapped with 1GB pages, which needs bit 17. If that bit is
+clear those entries are now omitted with a loud message instead of being emitted
+as an EPT misconfiguration, and memory above 4GB is left unmapped. That is a
+degraded state, not a good one, but it is honest and diagnosable; every CPU with
+EPT in practice supports 1GB pages.
