@@ -175,6 +175,12 @@ typedef struct _VMM_STATE {
     void*       msr_bitmap_va;
     uint64_t    msr_bitmap_pa;
 
+    // EPT page-typing totals from the identity-map build. Reported to the guest
+    // by hypercall 3 so it can confirm its RAM is actually mapped cacheable
+    // rather than taking the hypervisor's word for it.
+    uint64_t    ept_wb_pages;
+    uint64_t    ept_uc_pages;
+
     uint64_t    vmm_base_pa;
     uint64_t    vmm_size;
 

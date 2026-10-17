@@ -48,8 +48,7 @@ void* memcpy(void* dst, const void* src, size_t count) {
 }
 
 // Forward declarations for exit handlers
-void handle_msr_read(GUEST_REGS* regs);
-void handle_msr_write(GUEST_REGS* regs);
+int  handle_msr_write(GUEST_REGS* regs);
 void handle_cr_access(GUEST_REGS* regs);
 
 static void advance_guest_rip(void) {
@@ -87,6 +86,55 @@ static void halt_forever(void) {
 volatile uint32_t aria_exit_count = 0;
 // Track first 16 exit reasons for debugging
 volatile uint32_t aria_exit_log[16] = {0};
+// Per-reason exit counters, indexed by VM-exit reason 0-64. The log above shows
+// ordering; these show frequency, and the guest reads them via hypercall 2.
+volatile uint64_t aria_exit_reason_counts[65] = {0};
+
+// ---------------------------------------------------------------------------
+// Hypercall ABI (guest -> hypervisor)
+//
+// The guest issues VMCALL with the call number in RAX. Results come back in
+// registers only — translating a guest virtual address to a host pointer would
+// mean walking the guest's page tables, and no call here needs that.
+//
+//   0  VERSION      -> RAX=0, RBX=ABI version, RCX=0x61697241 ("Aria")
+//   1  EXIT_COUNT   -> RAX=0, RBX=total VM exits since launch
+//   2  EXIT_REASON  -> in RCX=reason, RAX=0, RBX=exit count for that reason
+//   3  EPT_TYPING   -> RAX=0, RBX=WB pages, RCX=UC pages
+//
+// An unknown call returns RAX=1.
+// ---------------------------------------------------------------------------
+#define ARIA_HC_VERSION      0
+#define ARIA_HC_EXIT_COUNT   1
+#define ARIA_HC_EXIT_REASON  2
+#define ARIA_HC_EPT_TYPING   3
+#define ARIA_ABI_VERSION     0x00010000ULL
+
+static void handle_hypercall(GUEST_REGS* regs) {
+    uint64_t nr = regs->rax;
+    regs->rax = 0;
+    switch (nr) {
+    case ARIA_HC_VERSION:
+        regs->rbx = ARIA_ABI_VERSION;
+        regs->rcx = 0x61697241ULL; // "Aria"
+        break;
+    case ARIA_HC_EXIT_COUNT:
+        regs->rbx = (uint64_t)aria_exit_count;
+        break;
+    case ARIA_HC_EXIT_REASON: {
+        uint32_t reason = (uint32_t)regs->rcx;
+        regs->rbx = (reason < 65) ? aria_exit_reason_counts[reason] : 0;
+        break;
+    }
+    case ARIA_HC_EPT_TYPING:
+        regs->rbx = g_vmm.ept_wb_pages;
+        regs->rcx = g_vmm.ept_uc_pages;
+        break;
+    default:
+        regs->rax = 1;
+        break;
+    }
+}
 
 void vmm_handle_exit(GUEST_REGS* regs) {
     uint32_t exit_reason = vmcs_read32(VMCS_EXIT_REASON) & 0xFFFF;
@@ -95,6 +143,7 @@ void vmm_handle_exit(GUEST_REGS* regs) {
     uint32_t idx = aria_exit_count;
     if (idx < 16) aria_exit_log[idx] = exit_reason;
     aria_exit_count++;
+    if (exit_reason < 65) aria_exit_reason_counts[exit_reason]++;
 
     switch (exit_reason) {
     case EXIT_REASON_EXCEPTION_NMI: // 0
@@ -121,7 +170,7 @@ void vmm_handle_exit(GUEST_REGS* regs) {
         // Hypervisor vendor leaf. The 12-byte string is returned in EBX:ECX:EDX
         // in little-endian byte order ("AriaAriaAria").
         if (leaf == 0x40000000) {
-            regs->rax = 0x40000001;         // highest supported hypervisor leaf
+            regs->rax = 0x40000002;         // highest supported hypervisor leaf
             regs->rbx = 0x61697241;         // "Aria"
             regs->rcx = 0x61697241;         // "Aria"
             regs->rdx = 0x61697241;         // "Aria"
@@ -129,12 +178,30 @@ void vmm_handle_exit(GUEST_REGS* regs) {
             break;
         }
         if (leaf == 0x40000001) {
-            regs->rax = 0x312E3041;         // interface signature "A0.1"
-            regs->rbx = 0; regs->rcx = 0; regs->rdx = 0;
+            // Interface description: ABI version in EAX, feature flags in EBX,
+            // highest hypercall number in ECX. A guest discovers the interface
+            // rather than hardcoding assumptions about what Aria supports.
+            regs->rax = ARIA_ABI_VERSION;
+            regs->rbx = (1u << 0)             // VMCALL hypercalls
+                      | (1u << 1)             // exit statistics
+                      | (1u << 2)             // EPT memory-typing report
+                      | (1u << 3);            // MSR write interception
+            regs->rcx = ARIA_HC_EPT_TYPING;   // highest hypercall implemented
+            regs->rdx = 0;
             advance_guest_rip();
             break;
         }
-        if (leaf >= 0x40000002 && leaf <= 0x4000000F) {
+        if (leaf == 0x40000002) {
+            // Live exit counter: the guest can observe that the hypervisor is
+            // actually running underneath it instead of taking that on faith.
+            uint64_t n = (uint64_t)aria_exit_count;
+            regs->rax = n & 0xFFFFFFFF;
+            regs->rbx = n >> 32;
+            regs->rcx = 0; regs->rdx = 0;
+            advance_guest_rip();
+            break;
+        }
+        if (leaf >= 0x40000003 && leaf <= 0x4000000F) {
             regs->rax = 0; regs->rbx = 0; regs->rcx = 0; regs->rdx = 0;
             advance_guest_rip();
             break;
@@ -175,10 +242,10 @@ void vmm_handle_exit(GUEST_REGS* regs) {
     }
 
     case EXIT_REASON_MSR_WRITE: { // 32
-        uint32_t msr = (uint32_t)regs->rcx;
-        extern void __writemsr(uint32_t, uint64_t);
-        __writemsr(msr, (regs->rdx << 32) | (regs->rax & 0xFFFFFFFF));
-        advance_guest_rip();
+        // Only the MSRs listed in vmm/msr_bitmap.c reach here. The handler
+        // mirrors the new value into the VMCS so the next VM entry does not
+        // revert it, and returns 0 when it injected an exception instead.
+        if (handle_msr_write(regs)) advance_guest_rip();
         break;
     }
 
@@ -207,6 +274,12 @@ void vmm_handle_exit(GUEST_REGS* regs) {
         // reproduced; advance RIP.
         advance_guest_rip();
         break;
+
+    case EXIT_REASON_VMCALL: { // 18
+        handle_hypercall(regs);
+        advance_guest_rip();
+        break;
+    }
 
     // --- VMX instruction exits -------------------------------------------------
     // VMX is reported as absent in CPUID, so these are only reachable if the

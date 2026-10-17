@@ -213,9 +213,14 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     }
     g_vmm.msr_bitmap_va = (void*)pa;
     g_vmm.msr_bitmap_pa = pa;
-    // MSR bitmap: 0 = passthrough (no exit), 1 = intercept (exit).
-    // All-zeros = passthrough all MSRs = correct for minimal hypervisor.
-    ZeroMem(g_vmm.msr_bitmap_va, PAGE_SIZE);
+    // MSR bitmap: 0 = passthrough (no exit), 1 = intercept (exit). Only the MSRs
+    // that VM entry reloads from the VMCS are intercepted; everything else runs
+    // natively. An all-zero bitmap would let a guest write those MSRs and then
+    // have the write silently reverted at the next VM entry.
+    {
+        extern void aria_build_msr_bitmap(void* bitmap);
+        aria_build_msr_bitmap(g_vmm.msr_bitmap_va);
+    }
 
     g_vmm.vmm_base_pa = g_vmm.vmxon_region_pa;
     g_vmm.vmm_size = 0x1000000;

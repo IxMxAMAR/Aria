@@ -14,6 +14,7 @@
   ../vmm/vmm.c
   ../vmm/vmcs.c
   ../vmm/ept.c
+  ../vmm/msr_bitmap.c
   ../vmm/exit_handlers/msr.c
   ../vmm/exit_handlers/cr_access.c
   ../vmm/asm/vmx_asm.asm

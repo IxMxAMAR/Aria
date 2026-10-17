@@ -149,6 +149,8 @@ int ept_build_identity_map_minimal(VMM_STATE* state) {
     state->eptp.value = 6ULL | (3ULL << 3)
                       | (state->ept_pml4_pa & 0x000FFFFFFFFFF000ULL);
 
+    state->ept_wb_pages = wb_pages;
+    state->ept_uc_pages = uc_pages;
     serial_print("[+] EPT typing: ");
     serial_print_dec(wb_pages);
     serial_print(" WB pages, ");

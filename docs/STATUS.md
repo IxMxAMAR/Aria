@@ -210,3 +210,57 @@ Residual risk: a 1GB page that spans an MMIO hole lying strictly inside it is
 typed from its two endpoints. Firmware normally covers MMIO with UC variable
 MTRRs, which the endpoint checks do catch, but this is not a general
 MTRR-overlap resolution.
+## Features
+
+### MSR interception
+
+The MSR bitmap (`vmm/msr_bitmap.c`) intercepts writes to the eight MSRs whose
+values VM entry reloads from the VMCS:
+
+    IA32_SYSENTER_CS / ESP / EIP, IA32_DEBUGCTL, IA32_PAT,
+    IA32_EFER, IA32_FS_BASE, IA32_GS_BASE
+
+Without interception a guest `WRMSR` to any of these succeeds on the hardware and
+is then silently reverted at the next VM entry, because the CPU reloads the MSR
+from a VMCS field that was never updated. Reads are deliberately not intercepted:
+they return the real MSR, which the handler keeps identical to the VMCS, so the
+fast path stays exit-free.
+
+`handle_msr_write()` validates before touching hardware. It runs in host context,
+so a value that would raise #GP on WRMSR would fault the hypervisor rather than
+the guest; a guest attempt to change EFER.LMA or set a reserved EFER bit is
+reflected back as a guest #GP instead.
+
+Known gap: `swapgs` changes GS base without an MSR write and is not
+interceptable. Whether VM exit independently saves the guest GS base is **not
+verified here**. If it does not, a guest that relies on `swapgs` would need the
+GS base captured and restored around each exit, and that needs hardware testing
+to establish.
+
+### Hypercall ABI
+
+The guest issues `VMCALL` with the call number in RAX; results come back in
+registers. The interface is discoverable rather than hardcoded — CPUID leaf
+0x40000001 reports the ABI version, a feature bitmap, and the highest
+implemented call.
+
+    leaf 0x40000000  vendor "AriaAriaAria", EAX = highest leaf (0x40000002)
+    leaf 0x40000001  ABI version (EAX), feature flags (EBX), max call (ECX)
+    leaf 0x40000002  live VM-exit counter (EDX:EAX)
+
+    call 0  VERSION      RBX = ABI version, RCX = "Aria"
+    call 1  EXIT_COUNT   RBX = total VM exits since launch
+    call 2  EXIT_REASON  in RCX = reason; RBX = count for that reason
+    call 3  EPT_TYPING   RBX = WB pages, RCX = UC pages
+
+An unknown call returns RAX = 1.
+
+This is the point of the interface: a guest can confirm the hypervisor is really
+there, how many exits it has taken, and whether its RAM is mapped cacheable —
+rather than trusting the hypervisor'"'"'s own log.
+
+### Exit statistics
+
+`aria_exit_reason_counts[65]` counts exits per reason. `aria_exit_log[16]` keeps
+the first sixteen in order, so a crash shows the sequence that led to it. Both
+are readable from the guest through hypercall 2.
