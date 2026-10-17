@@ -3,11 +3,25 @@
 #include "vmcs.h"
 #include "../efi/serial.h"
 
-static ARIA_ALIGN(4096) uint8_t ept_pool[4 * 1024 * 1024];
+// Split page tables have to live in memory the OS preserves. A static array here
+// would sit in the image's BSS, which the guest frees at ExitBootServices, and
+// every page table the EPT points at would be handed over to the guest.
+static uint8_t* ept_pool = NULL;
+static uint64_t ept_pool_size = 0;
 static uint64_t ept_pool_offset = 0;
 
+void ept_set_pool(void* base, uint64_t size) {
+    ept_pool = (uint8_t*)base;
+    ept_pool_size = size;
+    ept_pool_offset = 0;
+}
+
 static void* ept_runtime_alloc_page(void) {
-    if (ept_pool_offset + PAGE_SIZE > sizeof(ept_pool)) {
+    if (ept_pool == NULL) {
+        serial_print("[!] EPT pool not configured\n");
+        return NULL;
+    }
+    if (ept_pool_offset + PAGE_SIZE > ept_pool_size) {
         serial_print("[!] EPT pool exhausted\n");
         return NULL;
     }
@@ -56,13 +70,16 @@ int ept_split_2mb_to_4kb(VMM_STATE* state, uint64_t gpa) {
 
     uint64_t base_pfn = entry->pfn;
     uint64_t base_pa = (uint64_t)base_pfn << 12;
+    // Preserve the parent's memory type. Hardcoding WB here would silently make
+    // an uncached region cacheable the moment one page in it was split.
+    uint64_t parent_mt = entry->memory_type;
 
     for (int i = 0; i < 512; i++) {
         new_pt[i].value = 0;
         new_pt[i].read = 1;
         new_pt[i].write = 1;
         new_pt[i].execute = 1;
-        new_pt[i].memory_type = 6;
+        new_pt[i].memory_type = parent_mt;
         new_pt[i].pfn = (base_pa + i * PAGE_SIZE) >> 12;
     }
 

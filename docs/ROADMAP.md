@@ -92,4 +92,11 @@ tell it is virtualised, which is the honest design and the one worth building.
   writes GUEST_RSP/GUEST_RIP from the live context and `vmx_launch` already takes
   a `VMM_STATE*`, so AP bring-up is mechanically straightforward - but it is the
   single most likely thing to hang a machine on first boot, and stacking it on an
-  entirely unverified base makes a first hardware failure impossible to isolate.
+  entirely unverified base makes a first hardware failure impossible to isolate.- Item 3 (EPT protection of hypervisor memory) is implemented via
+  `ept_hide_range`, with the split pool moved to runtime memory and the split
+  preserving the parent memory type. Build-verified only. The EPT own page tables
+  are not yet protected.
+- Item 2 (AP virtualisation) is blocked on a loader refactor, not on the MP
+  protocol: an AP needs the relocated image to be valid at launch time, so the
+  image has to be snapshotted at the end of setup as well as at the handoff, and
+  the host state applied per-VMCS. See `docs/STATUS.md`.

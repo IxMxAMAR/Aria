@@ -318,3 +318,45 @@ VGA. A desktop usually has no serial port, so they now dump exit reason,
 qualification, guest `RIP`, `RSP`, `GPA` and the exit count to the VGA text
 buffer as well, and halt. This is the intended way to find out what went wrong on
 a first hardware run.
+### EPT protection of hypervisor memory — implemented, unverified
+
+`ept_hide_range` clears read/write/execute on the 4KB EPT entries covering the
+hypervisor's own pages, so the guest faults on any access instead of being able to
+read or overwrite the hypervisor. This is integrity, not concealment: the access
+takes an EPT violation and the panic dump names the GPA.
+
+Protected: VMXON region, VMCS region, MSR bitmap, host stack, the relocated image,
+and the loader's host CR3/GDT/IDT pages.
+
+Two bugs had to be fixed first, both of which would only have surfaced on
+hardware:
+
+- The split pool was a 4MB static array in `vmm/ept.c`, that is, in the image's
+  BSS. Splitting a 2MB page allocated the new page table from there, so the EPT
+  would have pointed at memory the guest frees at `ExitBootServices`. It is now
+  allocated as `EfiRuntimeServicesData` and handed to `ept_set_pool()`.
+- `ept_split_2mb_to_4kb` hardcoded memory type WB for all 512 entries instead of
+  preserving the parent's, so splitting a single page inside an uncached region
+  would have silently made the whole region cacheable.
+
+Deliberately not protected: the EPT's own page tables. `ept_walk` uses an entry's
+read bit as its present test, so hiding the GPAs that hold the tables interferes
+with the walk that would have to do the hiding. Remaining work.
+
+Splitting also makes `ept_wb_pages`/`ept_uc_pages` (hypercall 3) stale for the
+split regions, because those counts are accumulated over 2MB pages at build time.
+
+### AP virtualisation — dependency found, not started
+
+Item 2 has a real ordering problem that is not obvious from the roadmap. An AP's
+VMCS host state must point at the relocated image, because that is the only copy
+that survives the handoff. But the relocated image is not valid until
+`aria_loader_finalize()` copies it, which happens at `ExitBootServices`. An AP
+launched before that would jump to uninitialised memory on its first exit, and an
+AP cannot fix its own VMCS afterwards because the only correct host state is the
+one that is already too late to install.
+
+The fix is to snapshot the image once at the end of setup as well as at the
+handoff, so the relocated stub is valid from launch time onward, and to apply the
+host state per-VMCS at AP launch instead of only to the BSP at handoff. That is a
+prerequisite refactor in `efi/loader.c` and has not been done.

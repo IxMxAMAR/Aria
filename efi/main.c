@@ -436,6 +436,19 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         #undef R1
     }
 
+    // The EPT split pool must be in memory the OS preserves: the page tables it
+    // hands out are referenced by the EPT, and a static array would sit in the
+    // image BSS, which the guest frees at ExitBootServices.
+    {
+        EFI_PHYSICAL_ADDRESS pool_pa = 0xFFFFFFFFULL;
+        if (!EFI_ERROR(gBS->AllocatePages(AllocateMaxAddress, EfiRuntimeServicesData,
+                                         0x400, &pool_pa))) {
+            ept_set_pool((void*)(UINTN)pool_pa, 0x400000);
+        } else {
+            log_write("[!] EPT split pool allocation failed\n");
+        }
+    }
+
     // Relocate the hypervisor into runtime-preserved memory, and arrange to move
     // the VMCS host state there just before the guest calls ExitBootServices.
     // Without this the exit stub lives in EfiLoaderCode, which the OS frees.
@@ -443,6 +456,29 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         log_write("[!] loader prepare failed - will not survive handoff\n");
     }
     aria_loader_hook_exit_boot_services();
+
+    // Protect the hypervisor own memory from the guest. These pages are all
+    // runtime-preserved, so a well-behaved OS never touches them; if something
+    // does, it takes an EPT violation and the panic dump names the address.
+    // Note this is integrity, not concealment: the guest gets a fault, and the
+    // fault is reported rather than hidden.
+    if (g_vmm.vmxon_region_pa)
+        ept_hide_range(&g_vmm, g_vmm.vmxon_region_pa, PAGE_SIZE);
+    if (g_vmm.vmcs_region_pa)
+        ept_hide_range(&g_vmm, g_vmm.vmcs_region_pa, PAGE_SIZE);
+    if (g_vmm.msr_bitmap_pa)
+        ept_hide_range(&g_vmm, g_vmm.msr_bitmap_pa, PAGE_SIZE);
+    if (g_vmm.host_stack_pa)
+        ept_hide_range(&g_vmm, g_vmm.host_stack_pa, 0x10000);
+    if (g_loader.image_new_base)
+        ept_hide_range(&g_vmm, g_loader.image_new_base, g_loader.image_size);
+    if (g_loader.host_cr3_pa)
+        ept_hide_range(&g_vmm, g_loader.host_cr3_pa, PAGE_SIZE);
+    if (g_loader.host_gdt_base)
+        ept_hide_range(&g_vmm, g_loader.host_gdt_base, PAGE_SIZE);
+    if (g_loader.host_idt_base)
+        ept_hide_range(&g_vmm, g_loader.host_idt_base, PAGE_SIZE);
+    log_write("[+] hypervisor memory protected in the EPT\n");
 
     // Log right before VMLAUNCH so we know we got here
     log_write("[*] About to call vmx_launch\n");

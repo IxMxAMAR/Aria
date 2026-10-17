@@ -3,6 +3,7 @@
 
 #include "vmm.h"
 
+void ept_set_pool(void* base, uint64_t size);
 int ept_split_2mb_to_4kb(VMM_STATE* state, uint64_t guest_physical);
 int ept_install_split(VMM_STATE* state, uint64_t guest_physical,
                       void* clean_page, void* dirty_page);
