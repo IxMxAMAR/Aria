@@ -116,10 +116,31 @@ isolation layer. Read this before running it on hardware you care about.
 
 ## Build
 
+**Verified.** A clean rebuild (build output deleted, then rebuilt) completes with
+zero errors and produces:
+
+```
+AriaEfi.efi   26,624 bytes
+PE32+, machine 0x8664, subsystem 10 (EFI Application), entry RVA 0x1010
+SHA-256  2C80659EE8FA60B6FADC0E714CD45DB5818BF17794D03199CCDD522DAB865376
+```
+
+on Visual Studio 2026 (18.3) with MSVC 14.50.35717, against EDK2
+`edk2-stable202411`, with NASM 2.16.03. Repeating the build produces a
+byte-identical image.
+
 | Item | State |
 |---|---|
-| EDK2 package layout | `AriaPkg` exposed via a junction; `AriaPkg.dsc` has a `[Packages]` section |
-| Toolchain | EDK2 `VS2022` tag. EDK2's own `vswhere` detection stops below VS 2022, so `scripts/build_efi.bat` pins `VS2022_PREFIX` itself |
-| BaseTools | Installed from PyPI (`pip install edk2-basetools`) rather than compiled |
+| EDK2 package layout | `AriaPkg` exposed to the EDK2 workspace by a directory junction; `AriaPkg.dsc` has a `[Packages]` section |
+| Toolchain tag | EDK2 `VS2022`. EDK2's own `vswhere` detection stops below VS 2022, so `scripts/build_efi.bat` locates Visual Studio itself and sets `VS2022_PREFIX` to the newest MSVC toolset |
+| Python build tools | Installed from PyPI (`pip install edk2-basetools`) |
+| `GenFw` | **Cannot be compiled from source** on MSVC 14.4x+: EDK2's BaseTools sources trip newer warnings (`C4311`/`C4312`/`C4267`, promoted by `/WX`), and `MdePkg/IndustryStandard/PeImage.h` redefines `RUNTIME_FUNCTION` against the current Windows SDK. `scripts/build_efi.bat` fetches the prebuilt binaries tianocore publishes in `edk2-BaseTools-win32` instead. |
+| NASM | Mandatory — `MdePkg/BaseLib` has a `CpuId.nasm` even though all of Aria's own assembly is MASM |
+| Invoking `build` | Must be called with `call`. EDK2 puts a `build.bat` wrapper on the path, and calling a batch file from a batch file without `call` transfers control permanently, silently truncating the calling script. |
 | CI | `.github/workflows/build.yml` — builds on `windows-latest` |
 | Debug output | Always on, including in RELEASE builds; `serial_print`/`log_write` are called directly rather than through the `DBG_*` macros |
+
+### Not verified
+
+**Aria has never been run.** Every claim above is build-level only. No part of
+this document reflects an actual `VMLAUNCH` on hardware.

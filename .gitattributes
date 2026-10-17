@@ -1,0 +1,27 @@
+# Normalise line endings so the tree does not churn on checkout.
+#
+# Without this, git's core.autocrlf rewrites every text file on checkout and
+# the working tree shows as dirty even when nothing changed.
+* text=auto
+
+# Windows batch and UEFI Shell scripts must keep CRLF to run.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.nsh  text eol=crlf
+
+# Source, headers and docs are checked out with LF.
+*.c    text eol=lf
+*.h    text eol=lf
+*.asm  text eol=lf
+*.inf  text eol=lf
+*.dsc  text eol=lf
+*.dec  text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.nasm text eol=lf
+
+# Never touch binaries.
+*.efi  binary
+*.pdb  binary
+*.crt  binary
+*.cer  binary

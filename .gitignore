@@ -1,15 +1,23 @@
 # Build artifacts
 *.o
 *.obj
+*.lib
+*.dll
+*.map
 *.exe
 *.pdb
 *.efi
 build/
 Build/
 
-# Private signing material — NEVER commit
-mok/*.key
-mok/*.pfx
+# Private signing material — NEVER commit.
+# The public certificate (mok/aria_mok.crt, mok/aria_mok.cer) is intentionally
+# tracked; only the private key half is excluded here.
+*.key
+*.pfx
+*.p12
+*.priv
+mok/*.pem
 
 # Editor / OS
 .vscode/
