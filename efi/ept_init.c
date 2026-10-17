@@ -62,8 +62,12 @@ static uint8_t ept_get_memory_type(uint64_t phys) {
     return (result_type != 0xFF) ? result_type : mtrr_default_type;
 }
 
-// Whitelist MTRR approach: only WB for addresses explicitly in a WB variable MTRR.
-// Everything else is UC. This prevents WB on MMIO (which causes Machine Check).
+// MTRR-derived memory typing. A variable MTRR with type WB yields WB; a UC (or
+// any other) variable MTRR yields UC; and an address covered by no variable
+// MTRR takes the MTRR default type. The default is the important case: firmware
+// normally sets it to WB and leaves system RAM uncovered, using the variable
+// registers only to mark MMIO holes UC. Treating "uncovered" as UC marks every
+// byte of RAM uncached.
 static int mtrr_is_wb(uint64_t phys) {
     // Check if this address is in a variable MTRR with WB type
     for (int i = 0; i < mtrr_count; i++) {
@@ -77,7 +81,13 @@ static int mtrr_is_wb(uint64_t phys) {
             return 0; // any other type (WC, WT, WP) — use UC to be safe
         }
     }
-    return 0; // no MTRR covers this — UC (safe default)
+    // No variable MTRR covers this address, so the MTRR default type applies
+    // (SDM Vol 3 11.11.2.1). On real firmware the default is almost always WB,
+    // and system RAM is deliberately *not* covered by a variable MTRR: the
+    // variable registers exist to carve out UC MMIO holes. Returning UC here
+    // marked every byte of RAM uncached, which is why the guest crawled and why
+    // UEFI services (USB, GOP) appeared to hang.
+    return (mtrr_default_type == 6) ? 1 : 0;
 }
 
 int ept_build_identity_map_minimal(VMM_STATE* state) {
@@ -100,6 +110,11 @@ int ept_build_identity_map_minimal(VMM_STATE* state) {
     serial_print("\n");
 
     // 0-4GB: 2MB pages — MTRR whitelist (WB only where MTRR says WB)
+    // Count the resulting types so a hardware run can confirm the MTRR default
+    // was actually honoured: if system RAM is still coming out uncached, the WB
+    // count prints as 0 and the typing is still wrong.
+    uint32_t wb_pages = 0, uc_pages = 0;
+
     for (int gi = 0; gi < 4; gi++) {
         uint64_t pd_pa;
         uint64_t* pd = (uint64_t*)ept_alloc_page(&pd_pa);
@@ -112,6 +127,7 @@ int ept_build_identity_map_minimal(VMM_STATE* state) {
             // Only WB if BOTH start and end of 2MB range confirmed WB by MTRR
             if (phys >= 0x200000 && mtrr_is_wb(phys) && mtrr_is_wb(phys + 0x1FFFFF))
                 mt = 6;
+            if (mt == 6) wb_pages++; else uc_pages++;
 
             pd[pi] = 0x7ULL | (mt << 3) | (1ULL << 7)
                    | (phys & 0xFFFFFFFFFFE00000ULL);
@@ -124,6 +140,7 @@ int ept_build_identity_map_minimal(VMM_STATE* state) {
         uint64_t mt = 0; // UC default
         if (mtrr_is_wb(phys) && mtrr_is_wb(phys + 0x3FFFFFFF))
             mt = 6;
+        if (mt == 6) wb_pages++; else uc_pages++;
         pdpt[i] = 0x7ULL | (mt << 3) | (1ULL << 7)
                  | (phys & 0xFFFFFFFFC0000000ULL);
     }
@@ -132,7 +149,12 @@ int ept_build_identity_map_minimal(VMM_STATE* state) {
     state->eptp.value = 6ULL | (3ULL << 3)
                       | (state->ept_pml4_pa & 0x000FFFFFFFFFF000ULL);
 
-    serial_print("[+] Whitelist EPT, EPTP=");
+    serial_print("[+] EPT typing: ");
+    serial_print_dec(wb_pages);
+    serial_print(" WB pages, ");
+    serial_print_dec(uc_pages);
+    serial_print(" UC pages\n");
+    serial_print("[+] EPTP = ");
     serial_print_hex(state->eptp.value);
     serial_print("\n");
     return 0;

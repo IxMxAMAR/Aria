@@ -189,3 +189,24 @@ The VMCS layer was audited against the Intel SDM rather than assumed correct.
 
 `ept_init.c` beyond the identity-map construction and MTRR typing, and the
 assembly beyond the register-save order against `GUEST_REGS`.
+### Fixed after the audit: EPT memory typing
+
+`mtrr_is_wb()` returned UC for any address not covered by a variable MTRR. On
+real firmware `IA32_MTRR_DEF_TYPE` is normally WB and system RAM is deliberately
+left uncovered — the variable registers exist to mark MMIO holes UC. So the
+whitelist marked every byte of RAM uncached. That is why `main.c` describes the
+EPT as "ALL-UC", and why UEFI services (USB, GOP) hung: their DMA buffers were
+mapped uncached.
+
+Uncovered addresses now take the MTRR default type, which is what SDM Vol 3
+11.11.2.1 specifies. The builder also counts the resulting page types and prints
+them, so a hardware run can confirm the fix instead of assuming it:
+
+    [+] EPT typing: N WB pages, M UC pages
+
+A WB count of 0 means the typing is still wrong.
+
+Residual risk: a 1GB page that spans an MMIO hole lying strictly inside it is
+typed from its two endpoints. Firmware normally covers MMIO with UC variable
+MTRRs, which the endpoint checks do catch, but this is not a general
+MTRR-overlap resolution.
