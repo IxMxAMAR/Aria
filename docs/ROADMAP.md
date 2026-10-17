@@ -80,3 +80,8 @@ against the working core rather than reviving as-is.
 Making Aria hard to detect. It announces itself through CPUID leaf `0x40000000`
 and exposes a documented hypercall ABI; that is deliberate. A guest can always
 tell it is virtualised, which is the honest design and the one worth building.
+
+## Progress
+
+- Item 1 — surviving `ExitBootServices` — is implemented in `efi/loader.c`.
+  Build-verified only; not yet observed on hardware. See `docs/STATUS.md`.

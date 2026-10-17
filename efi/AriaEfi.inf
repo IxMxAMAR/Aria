@@ -10,6 +10,7 @@
   main.c
   vmx_init.c
   ept_init.c
+  loader.c
   serial.c
   ../vmm/vmm.c
   ../vmm/vmcs.c

@@ -264,3 +264,38 @@ rather than trusting the hypervisor'"'"'s own log.
 `aria_exit_reason_counts[65]` counts exits per reason. `aria_exit_log[16]` keeps
 the first sixteen in order, so a crash shows the sequence that led to it. Both
 are readable from the guest through hypercall 2.
+### Surviving ExitBootServices — implemented, unverified
+
+`efi/loader.c` keeps a copy of the whole image in `EfiRuntimeServicesCode` and
+gives the host its own state in `EfiRuntimeServicesData`:
+
+    image copy   EfiRuntimeServicesCode, allocated below 4GB
+    host CR3     identity map, 0-16GB, 2MB pages
+    host GDT     flat 64-bit code/data plus a TSS descriptor
+    host TSS     104-byte, RSP0 = top of the host stack
+    host IDT     every vector -> host_fault_halt
+
+No relocation engine is needed. The image is position independent, which was
+verified rather than assumed: there is no `.reloc` section and no `BASERELOC`
+data directory, `ImageBase` is 0, and a scan of `.data` found no absolute
+pointers into the image — the four 8-byte values that initially looked like
+pointers sit inside ASCII string literals.
+
+The handoff goes through a hypercall because the hook executes as the guest and
+cannot `VMWRITE`. `gBS->ExitBootServices` is wrapped; the wrapper issues
+`VMCALL(ARIA_HC_FINALIZE)`, which exits to root, where `aria_loader_finalize()`
+copies the live image (including current `.data`/`.bss`) into the runtime buffer
+and repoints `HOST_RIP`, `HOST_CR3`, `HOST_GDTR_BASE`, `HOST_IDTR_BASE`,
+`HOST_TR_SEL` and `HOST_TR_BASE`. The next VM exit enters the relocated stub.
+
+The exit stub now executes `cli` on entry so the handler cannot be interrupted in
+host context; VM entry restores the guest `RFLAGS` from `GUEST_RFLAGS`, so the
+guest `IF` is unaffected.
+
+The host stack is allocated below 4GB, because the host identity map covers
+0-16GB and the exit handler runs on that stack.
+
+**Unverified.** None of this has run. A hardware run needs to confirm three
+things: that the image really is position independent at a nonzero base; that the
+host CR3 and GDT are accepted on the first exit after the handoff; and that no
+relocated path touches `gBS`/`gST`, which are freed at that point.

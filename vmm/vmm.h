@@ -192,6 +192,14 @@ typedef struct _VMM_STATE {
 
 extern VMM_STATE g_vmm;
 
+// Hypercall numbers, passed to VMCALL in RAX. Documented in README.md.
+#define ARIA_HC_VERSION      0
+#define ARIA_HC_EXIT_COUNT   1
+#define ARIA_HC_EXIT_REASON  2
+#define ARIA_HC_EPT_TYPING   3
+#define ARIA_HC_FINALIZE     4
+#define ARIA_HC_MAX          ARIA_HC_FINALIZE
+
 void vmm_handle_exit(GUEST_REGS* regs);
 
 static inline void vmm_memset(void* dst, uint8_t val, size_t len) {

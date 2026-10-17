@@ -51,6 +51,9 @@ void* memcpy(void* dst, const void* src, size_t count) {
 int  handle_msr_write(GUEST_REGS* regs);
 void handle_cr_access(GUEST_REGS* regs);
 
+// efi/loader.c — root-side relocation of the hypervisor image.
+void aria_loader_finalize(void);
+
 static void advance_guest_rip(void) {
     uint64_t rip = vmcs_read64(VMCS_GUEST_RIP);
     uint32_t len = vmcs_read32(VMCS_VM_EXIT_INSN_LEN);
@@ -104,10 +107,6 @@ volatile uint64_t aria_exit_reason_counts[65] = {0};
 //
 // An unknown call returns RAX=1.
 // ---------------------------------------------------------------------------
-#define ARIA_HC_VERSION      0
-#define ARIA_HC_EXIT_COUNT   1
-#define ARIA_HC_EXIT_REASON  2
-#define ARIA_HC_EPT_TYPING   3
 #define ARIA_ABI_VERSION     0x00010000ULL
 
 static void handle_hypercall(GUEST_REGS* regs) {
@@ -129,6 +128,12 @@ static void handle_hypercall(GUEST_REGS* regs) {
     case ARIA_HC_EPT_TYPING:
         regs->rbx = g_vmm.ept_wb_pages;
         regs->rcx = g_vmm.ept_uc_pages;
+        break;
+    case ARIA_HC_FINALIZE:
+        // Relocate the image and repoint the VMCS host state. Issued by the
+        // ExitBootServices hook, which runs as the guest and so cannot VMWRITE
+        // for itself. Root context only, which is where this handler runs.
+        aria_loader_finalize();
         break;
     default:
         regs->rax = 1;
@@ -186,7 +191,7 @@ void vmm_handle_exit(GUEST_REGS* regs) {
                       | (1u << 1)             // exit statistics
                       | (1u << 2)             // EPT memory-typing report
                       | (1u << 3);            // MSR write interception
-            regs->rcx = ARIA_HC_EPT_TYPING;   // highest hypercall implemented
+            regs->rcx = ARIA_HC_MAX;          // highest hypercall implemented
             regs->rdx = 0;
             advance_guest_rip();
             break;

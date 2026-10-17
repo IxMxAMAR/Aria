@@ -7,6 +7,7 @@
 
 #include "vmx_init.h"
 #include "ept_init.h"
+#include "loader.h"
 #include "serial.h"
 #include "../vmm/vmm.h"
 #include "../vmm/vmcs.h"
@@ -199,7 +200,10 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     g_vmm.vmcs_region_pa = pa;
     ZeroMem(g_vmm.vmcs_region_va, PAGE_SIZE);
 
-    if (EFI_ERROR(gBS->AllocatePages(AllocateAnyPages, EfiRuntimeServicesData, 16, &pa))) {
+    // Below 4GB: the host identity map built by efi/loader.c covers 0-16GB, and
+    // the host stack must be mapped for the exit handler to run at all.
+    pa = 0xFFFFFFFFULL;
+    if (EFI_ERROR(gBS->AllocatePages(AllocateMaxAddress, EfiRuntimeServicesData, 16, &pa))) {
         log_write("[!] Memory allocation failed\n");
         return EFI_OUT_OF_RESOURCES;
     }
@@ -432,6 +436,14 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         #undef R1
     }
 
+    // Relocate the hypervisor into runtime-preserved memory, and arrange to move
+    // the VMCS host state there just before the guest calls ExitBootServices.
+    // Without this the exit stub lives in EfiLoaderCode, which the OS frees.
+    if (EFI_ERROR(aria_loader_prepare())) {
+        log_write("[!] loader prepare failed - will not survive handoff\n");
+    }
+    aria_loader_hook_exit_boot_services();
+
     // Log right before VMLAUNCH so we know we got here
     log_write("[*] About to call vmx_launch\n");
     con_print(L"[*] VMLAUNCH in 2s\r\n");
@@ -484,8 +496,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         return EFI_DEVICE_ERROR;
     }
 
-    // Hypervisor is active. Guest mode with ALL-UC EPT.
-    // Can't use UEFI services (USB/GOP hang under UC).
+    g_loader.active = TRUE;
+
+    // Hypervisor is active and the guest is running. The EPT is a full identity
+    // map typed from the MTRRs, so RAM is cacheable (the earlier all-uncached
+    // mapping was a bug; see docs/STATUS.md).
     // Return immediately — UEFI boot manager will boot Windows.
     // The hypervisor runs underneath, intercepting CPUID/CR/XSETBV.
     return EFI_SUCCESS;

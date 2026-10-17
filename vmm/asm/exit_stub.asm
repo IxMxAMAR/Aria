@@ -5,6 +5,9 @@ EXTERN vmm_handle_exit:PROC
 .code
 
 vm_exit_stub PROC
+    ; Interrupts are disabled for the duration of the handler. VM entry restores
+    ; the guest's RFLAGS from GUEST_RFLAGS, so the guest's IF is unaffected.
+    cli
     push    r15
     push    r14
     push    r13
@@ -69,5 +72,25 @@ vm_exit_stub PROC
     jmp     $
 
 vm_exit_stub ENDP
+
+; host_fault_halt — any exception taken in host context lands here. The IDT
+; built by efi/loader.c points every vector at this routine, so a host-side
+; fault halts visibly instead of triple-faulting the machine.
+host_fault_halt PROC
+    mov     rdx, 0B8000h
+    mov     word ptr [rdx], 0C48h      ; 'H'
+    mov     word ptr [rdx+2], 0C46h    ; 'F'
+    cli
+    hlt
+    jmp     $
+host_fault_halt ENDP
+
+; aria_vmcall — issue a hypercall with the call number in rcx.
+; Returns the hypervisor's status in rax.
+aria_vmcall PROC
+    mov     rax, rcx
+    vmcall
+    ret
+aria_vmcall ENDP
 
 END
