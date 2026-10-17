@@ -402,3 +402,14 @@ Two things made this possible, and both were prerequisites rather than plumbing:
 a zero timeout; console output is avoided but not proven safe; and an AP returning
 to the firmware MP dispatch code *as a guest* has never been observed. If a first
 hardware run hangs, disabling this is the first thing to try.
+### EPT own page tables — protected
+
+`ept_protect_own_tables` walks the EPT and hides the GPAs of every page table it
+finds (PML4, PDPT, PD and any split PT), plus the whole split pool. It runs last,
+because hiding a page can itself split a 2MB entry and allocate a page table from
+the pool.
+
+This closes the gap recorded above. It is safe for two reasons: hiding a leaf
+entry for one GPA does not disturb the entries used to walk to any other GPA, and
+the CPU walks the EPT through physical addresses rather than through the EPT, so
+an active page table can have its own GPA hidden without affecting the walk.

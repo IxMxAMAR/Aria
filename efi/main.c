@@ -479,6 +479,10 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         ept_hide_range(&g_vmm, g_loader.host_gdt_base, PAGE_SIZE);
     if (g_loader.host_idt_base)
         ept_hide_range(&g_vmm, g_loader.host_idt_base, PAGE_SIZE);
+    // Last, because hiding a page can itself split a 2MB entry and allocate a
+    // page table from the pool.
+    ept_protect_own_tables(&g_vmm);
+
     log_write("[+] hypervisor memory protected in the EPT\n");
 
     // Install the runtime host state now rather than at the handoff. Each AP

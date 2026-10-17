@@ -1,3 +1,5 @@
+#define EPT_MAX_TABLE_PAGES 256u
+
 // vmm/ept.c — EPT runtime management
 #include "ept.h"
 #include "vmcs.h"
@@ -175,4 +177,57 @@ void ept_invept_single(VMM_STATE* state, uint64_t addr) {
 void ept_invept_global(void) {
     struct { uint64_t eptp; uint64_t reserved; } desc = {0, 0};
     __invept(2, &desc);
+}
+
+// Hide the EPT's own page tables and the split pool from the guest. This runs
+// last, because hiding a page can itself split a 2MB entry and allocate a page
+// table from the pool.
+//
+// Hiding a leaf entry for a GPA does not disturb the entries used to walk to any
+// other GPA, and the CPU walks the EPT through physical addresses rather than
+// through the EPT, so an active page table can have its own GPA hidden without
+// affecting the walk.
+void ept_protect_own_tables(VMM_STATE* state) {
+    uint64_t pages[EPT_MAX_TABLE_PAGES];
+    uint32_t n = 0;
+
+    pages[n++] = state->ept_pml4_pa;
+    EPT_ENTRY* pml4 = state->ept_pml4;
+
+    for (int i = 0; i < 512; i++) {
+        if (!pml4[i].read) continue;
+        if (n >= EPT_MAX_TABLE_PAGES) break;
+        uint64_t pdpt_pa = (uint64_t)pml4[i].pfn << 12;
+        pages[n++] = pdpt_pa;
+
+        EPT_ENTRY* pdpt = (EPT_ENTRY*)pdpt_pa;
+        for (int j = 0; j < 512; j++) {
+            if (!pdpt[j].read || pdpt[j].large_page) continue;
+            if (n >= EPT_MAX_TABLE_PAGES) break;
+            uint64_t pd_pa = (uint64_t)pdpt[j].pfn << 12;
+            pages[n++] = pd_pa;
+
+            EPT_ENTRY* pd = (EPT_ENTRY*)pd_pa;
+            for (int k = 0; k < 512; k++) {
+                if (!pd[k].read || pd[k].large_page) continue;
+                if (n >= EPT_MAX_TABLE_PAGES) break;
+                pages[n++] = (uint64_t)pd[k].pfn << 12;   // a split page table
+            }
+        }
+    }
+
+    for (uint32_t k = 0; k < n; k++) {
+        ept_hide_range(state, pages[k], PAGE_SIZE);
+    }
+
+    // The whole pool, not just the used prefix: hiding it can allocate from it.
+    if (ept_pool != NULL && ept_pool_size != 0) {
+        ept_hide_range(state, (uint64_t)(UINTN)ept_pool, ept_pool_size);
+    }
+
+    serial_print("[+] EPT own tables protected: ");
+    serial_print_dec(n);
+    serial_print(" table pages, pool ");
+    serial_print_dec((uint32_t)(ept_pool_size >> 12));
+    serial_print(" pages\n");
 }

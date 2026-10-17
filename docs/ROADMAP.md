@@ -103,4 +103,5 @@ tell it is virtualised, which is the honest design and the one worth building.
   loader refactor it required: the image is snapshotted at the end of setup as well
   as at the handoff, and host state is applied per-VMCS. Build-verified only. This
   is the riskiest component in the tree and the first thing to disable if a first
-  boot hangs.
+  boot hangs.- Item 3 is now complete at build level: `ept_protect_own_tables` also hides the
+  EPT own page tables and the split pool, closing the gap recorded above.
