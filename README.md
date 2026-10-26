@@ -73,10 +73,10 @@ Aria configures the VMCS for the current processor, executes `VMLAUNCH`, and
 returns to the firmware. The firmware's boot manager then loads Windows, which
 runs as the guest.
 
-**Use a machine you can afford to hard-hang.** Current limitations are
-significant â€” in particular there is no SMP support and no host lifetime
-management, both of which can stop the machine dead. Read
-[docs/STATUS.md](docs/STATUS.md) first.
+**Use a machine you can afford to hard-hang.** Aria has never been run. What
+exists is build-verified only: SMP bring-up, the `ExitBootServices` handoff and
+EPT protection of the hypervisor's own memory are all in the tree and none of
+them has been observed on hardware. Read [docs/STATUS.md](docs/STATUS.md) first.
 
 ## License
 
@@ -100,12 +100,12 @@ The guest can issue `VMCALL` with the call number in RAX:
 | 1 | `EXIT_COUNT` | RBX = total VM exits since launch |
 | 2 | `EXIT_REASON` | in RCX = reason, RBX = count for that reason |
 | 3 | `EPT_TYPING` | RBX = WB pages, RCX = UC pages |
-| 4 | `FINALIZE` | internal — used by the ExitBootServices hook |
+| 4 | `FINALIZE` | internal â€” used by the ExitBootServices hook |
 | 5 | `TSC_OFFSET` | RBX = accumulated TSC offset (signed) |
 
 An unknown call returns RAX = 1.
 
 See [docs/STATUS.md](docs/STATUS.md) for what is implemented and what is not, and
-[docs/ROADMAP.md](docs/ROADMAP.md) for what comes next — the first item there is
-the one that matters: Aria's code image does not yet survive the guest calling
-`ExitBootServices`.
+[docs/ROADMAP.md](docs/ROADMAP.md) for what comes next â€” the first item there is
+the one that matters: Aria has never executed a `VMLAUNCH`, so nothing in this
+repository has been confirmed by anything except a compiler.

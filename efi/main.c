@@ -350,10 +350,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     }
     con_print(L"[+] VMCS configured\r\n");
 
-    // Hide VMM memory from guest EPT BEFORE vmx_launch.
-    // SKIP EPT hiding for now — test pure identity map first.
-    // Re-enable once we confirm EPT + exit handler works.
-    log_write("[*] EPT hiding SKIPPED (debug)\n");
+    // The hypervisor's own pages are hidden from the guest further down, once the
+    // loader has allocated the runtime image and the EPT split pool exists.
+    // (This spot used to log "EPT hiding SKIPPED (debug)", a marker left over from
+    // bringing the EPT up; it kept printing that hiding had not happened long
+    // after it did.)
 
     // Compact VMCS dump — fits on one screen
     {

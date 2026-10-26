@@ -2,63 +2,86 @@
 
 Ordered by what actually blocks the next step, not by what is most interesting.
 
-## 1. Survive `ExitBootServices` — blocking
+## 0. Run it — blocking everything
 
-This is the single thing standing between "it launches" and "it runs Windows".
+Every item below that is marked implemented is build-verified only. Aria has
+never executed a `VMLAUNCH` on hardware. Until it does, the whole tree is a
+hypothesis with a linker receipt, and the next most valuable thing anyone can do
+is not more code.
 
-Aria's code lives in the module image, which the firmware loads into
-`EfiLoaderCode`. When the guest OS calls `ExitBootServices`, that memory becomes
-free for the OS to reuse — and the hypervisor's `HOST_RIP` still points into it.
-`HOST_CR3` is likewise the firmware's page tables, which the OS replaces, and the
-host `GDTR`/`IDTR`/`TR` bases point at firmware tables the OS also reuses.
+What a first run has to answer, in this order:
 
-The first VM exit after the handoff therefore lands in reused memory and faults.
-Those exits are not rare: the OS executes `CPUID` within its first few thousand
-instructions, and `CPUID` is intercepted.
+1. Does `VMLAUNCH` succeed at all, and if not, which VM-instruction error?
+   `main.c` prints the SDM Table 30-1 meaning and stalls 30 seconds.
+2. Does the first VM exit reach `vm_exit_stub` in the *relocated* image, on the
+   host CR3, GDT, IDT and TSS that `efi/loader.c` built?
+3. Does the `[+] EPT typing: N WB pages, M UC pages` line show a non-zero WB
+   count, i.e. is guest RAM actually cacheable?
+4. Do the APs launch, and does the machine survive them returning to the
+   firmware's MP dispatch code as guests?
+5. Does the guest survive `ExitBootServices`, and does hypercall 1 keep counting
+   upward afterwards?
 
-What is already safe: the VMCS, VMXON region, EPT, MSR bitmap and host stack are
-all allocated as `EfiRuntimeServicesData`, which the OS preserves.
+A machine with serial output answers all five; a machine without one still
+answers them on the VGA text buffer, which is why the panic paths write there.
 
-What has to be built — a small loader:
+## 1. Survive `ExitBootServices` — implemented, unverified
 
-1. Copy the module image (at least `.text`, `.rdata`, `.data`) into
-   runtime-allocated pages, applying base relocations.
-2. Build a host page table that identity-maps those pages plus the host stack,
-   and point `HOST_CR3` at it.
-3. Rebuild a host GDT/IDT and the TSS inside the same region and point
-   `HOST_GDTR_BASE`, `HOST_IDTR_BASE` and `HOST_TR_BASE` at them.
-4. Hook `ExitBootServices` to finalise the handoff, and to fail loudly if the
-   relocation did not happen.
+Aria's code originally lived only in the module image, in `EfiLoaderCode`. When
+the guest OS called `ExitBootServices` that memory became free to reuse while the
+hypervisor's `HOST_RIP` still pointed into it, `HOST_CR3` was the firmware's page
+tables, and the host `GDTR`/`IDTR`/`TR` bases pointed at firmware tables the OS
+also reused. The first VM exit after the handoff therefore landed in reused
+memory and faulted — and those exits are not rare, because the OS executes
+`CPUID` within its first few thousand instructions and `CPUID` is intercepted.
 
-Until this exists, Aria is a proof of concept that runs until the guest takes
-over the machine. That should be stated plainly rather than implied.
+`efi/loader.c` now keeps a copy of the whole image in `EfiRuntimeServicesCode`,
+builds a host identity map, GDT, TSS and IDT in `EfiRuntimeServicesData`, and
+installs them per-VMCS at launch time. No relocation engine was needed: the image
+is position independent, which was verified rather than assumed (no `.reloc`
+section, no `BASERELOC` directory, `ImageBase` 0, and no absolute pointers into
+the image in `.data`).
 
-## 2. Virtualise the other logical processors — blocking for a real guest
+`ExitBootServices` is still hooked, but only to record and verify the handoff —
+see `docs/STATUS.md` for why re-copying the image there was wrong.
 
-Only the BSP executes `VMXON`. Every AP runs unvirtualised, so the guest sees
-inconsistent behaviour between cores and none of the intercepts apply to AP
+## 2. Virtualise the other logical processors — implemented, unverified
+
+Only the BSP executed `VMXON`; every AP ran unvirtualised, so the guest saw
+inconsistent behaviour between cores and none of the intercepts applied to AP
 workloads.
 
-The shape: enumerate processors with `EFI_MP_SERVICES_PROTOCOL` and run a per-AP
-initialisation procedure that allocates its own VMXON region, VMCS and host
-stack, then does `VMXON` + `VMLAUNCH` in place. Each AP needs its own per-CPU
-state; `g_vmm` being a single global is the first thing to change.
+`efi/smp.c` enumerates processors with `EFI_MP_SERVICES_PROTOCOL` and runs a
+per-AP start-up procedure that allocates its own VMXON region, VMCS and host
+stack, then does `VMXON` + `VMLAUNCH` in place. APs launch before the BSP so a
+failure is reported while the machine is still in a known state.
 
-## 3. Give the hypervisor its own memory protection
+This needed a real prerequisite, not just plumbing: an AP VMCS must point at the
+relocated image, but that image was only valid after the handoff, and a launched
+AP cannot repair its own VMCS. So the image is snapshotted at the end of setup and
+the host state is applied per-VMCS. This is the riskiest component in the tree
+and the first thing to disable if a first boot hangs.
 
-The EPT is a full RWX identity map, so the guest can read and write the
-hypervisor's own pages. Marking the VMM's pages no-access in the EPT and
-reporting violations is the standard fix.
+## 3. Give the hypervisor its own memory protection — implemented, unverified
+
+The EPT was a full RWX identity map, so the guest could read and write the
+hypervisor's own pages. `ept_hide_range` now clears read/write/execute on the
+4 KB entries covering the VMM's pages, and `ept_protect_own_tables` closes the
+last gap by hiding the EPT's own page tables and the split pool.
 
 Note the distinction this project draws: *protecting* the hypervisor is
-integrity, and a violation should be reported loudly. *Hiding* the hypervisor
-from the guest is deception, and is out of scope.
+integrity, and a violation is reported loudly. *Hiding* the hypervisor from the
+guest is deception, and is out of scope.
 
-## 4. Time
+## 4. Time — implemented, unverified
 
-`VMCS_TSC_OFFSET` is written as 0 and never used. A guest reading `RDTSC` across
-exits observes time spent inside the hypervisor. Using the TSC-offsetting control
-(and/or intercepting `RDTSC`) makes guest time monotonic and stable.
+`VMCS_TSC_OFFSET` was written as 0 and never used, so a guest reading `RDTSC`
+across exits observed time spent inside the hypervisor. The TSC-offsetting
+control (processor-based bit 3) is now enabled and `vmm_handle_exit` charges its
+own run time to the hypervisor, which keeps guest time monotonic.
+
+Not done: TSC scaling, and `RDTSC` exiting. Neither is needed for a guest that
+stays on one host.
 
 ## 5. Nested VMX
 
@@ -68,12 +91,27 @@ instruction length; there is no GPR context switch; `shadow_ept_compose_page()`
 is never called; and a second `VMPTRLD` discards the first. It needs rewriting
 against the working core rather than reviving as-is.
 
-## 6. Breadth
+## 6. Interrupts, timers and the rest
 
-- IO port interception plus an emulation path
-- Exception bitmap for selected vectors
-- EPT watchpoints for memory introspection
-- A guest-visible telemetry buffer (paged, rather than register-only)
+In rough order of what a general-purpose guest would notice first:
+
+- Interrupt/APIC virtualisation: virtual interrupt delivery, TPR shadow, posted
+  interrupts, APIC-access page. Today the guest gets native interrupts and Aria
+  has no say in their delivery.
+- The VMX-preemption timer and interrupt-window exiting. A guest that masks
+  interrupts and spins is never preempted.
+- IO port interception plus an emulation path.
+- An exception bitmap for selected vectors.
+- EPT watchpoints for memory introspection.
+- A guest-visible telemetry buffer (paged, rather than register-only).
+- IOMMU / VT-d, so device DMA can be constrained at all.
+
+## 7. Breadth
+
+- A guest-side test image that exercises the hypercall ABI and asserts on the
+  results, so a run produces a pass/fail rather than a serial log to read.
+- Unit tests for the pure logic — MTRR resolution, EPT walk/split, segment
+  descriptor decoding, MSR bitmap construction. None of these need VT-x.
 
 ## Explicitly out of scope
 
@@ -83,25 +121,19 @@ tell it is virtualised, which is the honest design and the one worth building.
 
 ## Progress
 
-- Item 1 � surviving `ExitBootServices` � is implemented in `efi/loader.c`.
-  Build-verified only; not yet observed on hardware. See `docs/STATUS.md`.- Item 4 (TSC offsetting) is implemented: processor-based control bit 3 plus
-  per-exit accounting in `vmm_handle_exit`. Build-verified only.
-- Fatal exits now dump reason, qualification, RIP, RSP, GPA and exit count to VGA
-  as well as serial, because a desktop with no serial has only the screen.
-- Item 2 (AP virtualisation) is deliberately not started yet. `vmx_do_launch`
-  writes GUEST_RSP/GUEST_RIP from the live context and `vmx_launch` already takes
-  a `VMM_STATE*`, so AP bring-up is mechanically straightforward - but it is the
-  single most likely thing to hang a machine on first boot, and stacking it on an
-  entirely unverified base makes a first hardware failure impossible to isolate.- Item 3 (EPT protection of hypervisor memory) is implemented via
-  `ept_hide_range`, with the split pool moved to runtime memory and the split
-  preserving the parent memory type. Build-verified only. The EPT own page tables
-  are not yet protected.
-- Item 2 (AP virtualisation) is blocked on a loader refactor, not on the MP
-  protocol: an AP needs the relocated image to be valid at launch time, so the
-  image has to be snapshotted at the end of setup as well as at the handoff, and
-  the host state applied per-VMCS. See `docs/STATUS.md`.- Item 2 (AP virtualisation) is implemented in `efi/smp.c`, together with the
-  loader refactor it required: the image is snapshotted at the end of setup as well
-  as at the handoff, and host state is applied per-VMCS. Build-verified only. This
-  is the riskiest component in the tree and the first thing to disable if a first
-  boot hangs.- Item 3 is now complete at build level: `ept_protect_own_tables` also hides the
-  EPT own page tables and the split pool, closing the gap recorded above.
+- **0 — run it.** Not started. This is the only item that can invalidate
+  everything else.
+- **1 — surviving `ExitBootServices`.** Implemented in `efi/loader.c`, including
+  the per-VMCS host state that item 2 needed. Build-verified only.
+- **2 — AP virtualisation.** Implemented in `efi/smp.c`. Build-verified only,
+  and the most likely thing to hang a first boot.
+- **3 — EPT protection.** Complete at build level: `ept_hide_range` for the VMM
+  pages, `ept_protect_own_tables` for the EPT's own tables and the split pool,
+  and the split pool moved into runtime memory so the guest cannot free it.
+- **4 — TSC offsetting.** Implemented and reachable; the control bit is masked
+  off automatically on a CPU that does not allow it.
+- **5 — nested VMX.** Not started. Deliberately behind item 0.
+- **6, 7 — breadth.** Not started.
+- Diagnostics, which is not a roadmap item but has absorbed most of the work:
+  fatal exits now dump reason, qualification, `RIP`, `RSP`, GPA and exit count to
+  VGA as well as serial, because a desktop with no serial has only the screen.

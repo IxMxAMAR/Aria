@@ -8,41 +8,50 @@ Per-subsystem status, kept honest on purpose. The vocabulary is deliberate:
 - **not implemented** â€” the code does not exist, or exists but is unreachable
 - **excluded** â€” source is present but deliberately not built
 
-If a row says "implemented" and you find it does not work, that is a bug in this
-document as much as in the code. Please fix the document.
+Nothing in this document is **works**. Aria has been built and inspected but
+never run; see "Not verified" at the end. If a row says "implemented" and you
+find it does not work, that is a bug in this document as much as in the code.
+Please fix the document.
 
 ## Core
 
 | Subsystem | State | Notes |
 |---|---|---|
 | UEFI application entry + bring-up | implemented | `efi/main.c` |
-| VT-x capability check | partial | Checks `CPUID.1:ECX[5]` and `IA32_FEATURE_CONTROL` bit 2 only; never tests bit 1 (VMX outside SMX) |
+| VT-x capability check | partial | Tests `CPUID.1:ECX[5]` and `IA32_FEATURE_CONTROL` bit 2 only; never tests bit 1 (VMX outside SMX) |
 | VMXON / VMCLEAR / VMPTRLD | implemented | Statuses checked (`efi/vmx_init.c`) |
-| VMCS host-state population | implemented | Single processor |
+| VMCS host-state population | implemented | Per-VMCS, so the BSP and every AP each get their own |
+| VMCS host-state validation | implemented | `vmcs_validate_host_state()` against SDM 26.2, report-only |
 | VMCS guest-state population | implemented | Guest state is the live CPU state (in-place design) |
-| VMCS control fields | implemented | See "Control-field caveats" below |
+| VMCS control fields | implemented | See "Control-field notes" |
 | VM-entry / VM-exit | implemented | `vmx_do_launch` in `vmm/asm/vmx_asm.asm` |
-| EPT construction | partial | Full identity map, 0â€“512 GB, 2 MB pages below 4 GB and 1 GB pages above |
+| Exit dispatcher | implemented | `vmm/vmm.c`; a `switch`, not a table |
+| Unhandled-exit behaviour | implemented | Reports to serial *and* VGA, then halts (`ARIA_STRICT_EXITS`) |
+| EPT construction | partial | Full identity map: 2 MB pages 0â€“4 GB, 1 GB pages 4â€“512 GB |
+| EPT capability validation | implemented | Reads `IA32_VMX_EPT_VPID_CAP` before building |
 | EPT memory typing | partial | MTRR-derived; see caveats |
-| EPT hypervisor-memory protection | **not implemented** | Guest can read/write all VMM memory â€” see Security |
-| Exit dispatcher | implemented | `vmm/vmm.c` |
-| Exit dispatch table | not implemented | A `switch`, not a table |
-| Unhandled-exit behaviour | implemented | Reports and stops (`ARIA_STRICT_EXITS`) |
+| EPT protection of hypervisor memory | implemented | `ept_hide_range` + `ept_protect_own_tables` |
+| Hypervisor lifetime across `ExitBootServices` | implemented | `efi/loader.c` |
+| SMP / AP virtualisation | implemented | `efi/smp.c` |
 
 ## Interception
 
 | Subsystem | State | Notes |
 |---|---|---|
 | CPUID interception | implemented | Announces Aria; VMX bit reported absent |
-| CR access interception | partial | CR4 only (`vmm/exit_handlers/cr_access.c`) |
-| MSR interception | **not implemented** | MSR bitmap is all zeros, so no MSR access exits |
+| CR access interception | partial | CR4 only: `CR4_GUEST_HOST_MASK` is `CR4_VMXE`, `CR0_GUEST_HOST_MASK` is 0 |
+| MSR write interception | implemented | The 8 MSRs VM entry reloads from the VMCS |
+| MSR read interception | implemented, unreachable | No read is intercepted, so the handler never runs |
 | I/O port interception | not implemented | Unconditional I/O exiting is off; guest has native port I/O |
 | Exception interception | not implemented | Exception bitmap is 0 |
 | Interrupt / NMI interception | not implemented | Disabled in pin-based controls by design |
 | XSETBV interception | implemented | XCR index validated before forwarding |
-| TSC offsetting / scaling | not implemented | `TSC_OFFSET` written as 0 |
+| INVD interception | implemented | Treated as a no-op with the guest RIP advanced |
+| VMX instruction exits | implemented | Reported as `#UD`, matching a CPU without VMX |
+| HLT / MWAIT / RDTSC / INVLPG | not implemented | Not intercepted, so the guest executes them natively |
+| TSC offsetting / scaling | implemented (offsetting only) | Processor-based control bit 3; TSC scaling is not used |
 
-## Control-field caveats
+## Control-field notes
 
 These are the ones that have already caused bugs, or are known to be wrong:
 
@@ -58,22 +67,186 @@ These are the ones that have already caused bugs, or are known to be wrong:
 - **Debug controls are not saved or loaded**, so `VMCS_GUEST_DR7` and
   `VMCS_GUEST_IA32_DEBUGCTL` are inert and the guest's values leak to the host.
 - **No MSR load/store lists** are configured.
+- **Processor-based control bit 3 is "Use TSC offsetting"** (not HLT exiting,
+  which is bit 7). The numbering was checked against the SDM layout as encoded in
+  Linux's `arch/x86/include/asm/vmxfeatures.h`, because the comment in
+  `vmx_init.c` and the accounting in `vmm.c` are only consistent if that is the
+  bit.
+- **HLT exiting is deliberately not requested.** If it ever is, `vmm_handle_exit`
+  has no `HLT` case and `ARIA_STRICT_EXITS` would halt the machine on the guest's
+  first `HLT`, which for Windows is the idle loop.
 
-## Not implemented
+## Exit handling and diagnostics
 
-Ordered roughly by how much they block a usable hypervisor.
+The dispatcher handles reasons 0 (exception/NMI), 1 (external interrupt), 2
+(triple fault), 10 (CPUID), 13 (INVD), 18 (VMCALL), 19â€“27 (the VMX instruction
+exits, all reflected as `#UD`), 28 (CR access), 31 (MSR read), 32 (MSR write), 48
+(EPT violation), 49 (EPT misconfiguration), 50 (INVEPT), 53 (INVVPID), 55
+(XSETBV) and 59 (VMFUNC). Everything else is fatal: reason, qualification, guest
+`RIP`/`RSP`, GPA and exit count go to serial *and* to the VGA text buffer before
+the machine halts. A desktop usually has no serial port, so the VGA copy is the
+one that matters.
 
-| Gap | Impact |
-|---|---|
-| **SMP / AP bring-up** | Only the boot processor is virtualized. Every other core runs the guest natively, un-intercepted, with access to VMM memory. There is no per-CPU state, no `INIT`/`SIPI` handling, no IPI coordination. |
-| **Host lifetime management** | No `ExitBootServices` hook. `HOST_CR3` is the firmware's CR3 and `HOST_RIP` points into the application's own image, which is `EfiLoaderCode`/`EfiLoaderData` â€” memory the OS is free to reuse. The first VM exit after the OS takes over memory can fault in host context. |
-| **Nested VMX** | See below. |
-| **Interrupt / APIC virtualization** | No virtual interrupt delivery, no TPR shadow, no posted interrupts, no APIC-access page. |
-| **Timers / preemption** | No VMX-preemption timer, no interrupt-window exiting. A guest that masks interrupts and spins is never preempted. |
-| **Hypervisor memory protection** | VMM pages are inside the guest's identity map, writable. |
-| **IOMMU / VT-d** | No DMA remapping; devices DMA against host physical addresses, bypassing the EPT. |
-| **Secure Boot signing** | `mok/` holds a self-signed public certificate. There is no private key in the repository and no signing step in any script. MOK is a shim concept and cannot authorize a firmware-launched UEFI application, so the current path is incomplete. |
-| **Testing** | No unit tests. CI builds only. |
+`aria_exit_reason_counts[65]` counts exits per reason and `aria_exit_log[16]`
+keeps the first sixteen in order, so a crash shows the sequence that led to it.
+Both are readable from the guest through hypercall 2.
+
+## Hypervisor interface
+
+Aria announces itself rather than trying to hide.
+
+    leaf 0x40000000  vendor "AriaAriaAria", EAX = highest leaf (0x40000002)
+    leaf 0x40000001  EAX = ABI version, EBX = feature flags, ECX = max call
+    leaf 0x40000002  live VM-exit counter (EDX:EAX)
+
+    call 0  VERSION      RBX = ABI version, RCX = "Aria"
+    call 1  EXIT_COUNT   RBX = total VM exits since launch
+    call 2  EXIT_REASON  in RCX = reason; RBX = count for that reason
+    call 3  EPT_TYPING   RBX = WB pages, RCX = UC pages
+    call 4  FINALIZE     internal â€” issued by the ExitBootServices hook
+    call 5  TSC_OFFSET   RBX = accumulated TSC offset (signed)
+
+An unknown call returns RAX = 1. This is the point of the interface: a guest can
+confirm the hypervisor is really there, how many exits it has taken, and whether
+its RAM is mapped cacheable, rather than trusting the hypervisor's own log.
+
+## Surviving `ExitBootServices`
+
+`efi/loader.c` keeps a copy of the whole image in `EfiRuntimeServicesCode` and
+gives the host its own state in `EfiRuntimeServicesData`:
+
+    image copy   EfiRuntimeServicesCode, allocated below 4 GB
+    host CR3     identity map, 0-16 GB, 2 MB pages
+    host GDT     flat 64-bit code/data plus a TSS descriptor
+    host TSS     104-byte, RSP0 = top of the host stack
+    host IDT     every vector -> host_fault_halt
+
+No relocation engine is needed. The image is position independent, which was
+verified rather than assumed: there is no `.reloc` section and no `BASERELOC`
+data directory, `ImageBase` is 0, and a scan of `.data` found no absolute
+pointers into the image â€” the four 8-byte values that initially looked like
+pointers sit inside ASCII string literals.
+
+The host state is installed **at launch**, not at the handoff, by
+`aria_loader_apply_host_state()` â€” called for the BSP in `main.c` and for each AP
+inside its own start-up procedure. From the first VM exit onward the hypervisor
+therefore runs from the relocated copy, on its own page tables, GDT, IDT and TSS.
+The host identity map only has to cover the runtime image and the host stack,
+both allocated below 4 GB, so nothing on the exit path touches memory above that.
+
+`aria_loader_finalize()` (hypercall 4) is the handoff marker. It does **not**
+re-copy the image: the code executing it *is* the relocated copy and has been
+accumulating state since the first exit, so copying the original over it would
+reset the exit counters and the accumulated TSC offset to their setup-time
+values, and would overwrite the `finalized` flag it had just set, defeating its
+own idempotence check. It records the handoff, prints `HOST_RIP` and `HOST_CR3`,
+and reports loudly if either has left runtime-preserved memory.
+
+The exit stub executes `cli` on entry so the handler cannot be interrupted in
+host context; VM entry restores the guest `RFLAGS` from `GUEST_RFLAGS`, so the
+guest `IF` is unaffected.
+
+**Unverified.** A hardware run needs to confirm that the image really is position
+independent at a nonzero base, that the host CR3 and GDT are accepted on the
+first exit, and that no relocated path touches `gBS`/`gST`, which are freed at
+the handoff.
+
+## EPT protection of hypervisor memory
+
+`ept_hide_range` clears read/write/execute on the 4 KB EPT entries covering the
+hypervisor's own pages, so the guest faults on any access instead of being able
+to read or overwrite the hypervisor. This is integrity, not concealment: the
+access takes an EPT violation and the panic dump names the GPA.
+
+Protected: VMXON region, VMCS region, MSR bitmap, host stack, the relocated
+image, the loader's host CR3/GDT/IDT pages, the EPT's own page tables (PML4,
+PDPT, PD and any split PT), and the whole split pool.
+
+`ept_protect_own_tables` runs last, because hiding a page can itself split a
+2 MB entry and allocate a page table from the pool. It is safe for two reasons:
+hiding a leaf entry for one GPA does not disturb the entries used to walk to any
+other GPA, and the CPU walks the EPT through physical addresses rather than
+through the EPT, so an active page table can have its own GPA hidden without
+affecting the walk.
+
+Two bugs had to be fixed first, both of which would only have surfaced on
+hardware:
+
+- The split pool was a 4 MB static array in `vmm/ept.c`, that is, in the image's
+  BSS. Splitting a 2 MB page allocated the new page table from there, so the EPT
+  would have pointed at memory the guest frees at `ExitBootServices`. It is now
+  allocated as `EfiRuntimeServicesData` and handed to `ept_set_pool()`.
+- `ept_split_2mb_to_4kb` hardcoded memory type WB for all 512 entries instead of
+  preserving the parent's, so splitting a single page inside an uncached region
+  would have silently made the whole region cacheable.
+
+Splitting also makes `ept_wb_pages`/`ept_uc_pages` (hypercall 3) stale for the
+split regions, because those counts are accumulated over 2 MB pages at build
+time.
+
+## Time
+
+`VMCS_TSC_OFFSET` is live. Processor-based control bit 3 ("use TSC offsetting")
+is enabled, and `vmm_handle_exit` charges the time it spends in root context to
+the hypervisor: the offset accumulates `-(tsc_out - tsc_in)`, so the guest's
+`RDTSC` does not advance while the guest is not running. The accumulated value is
+readable through hypercall 5.
+
+`vmx_adjust_controls` masks bit 3 off if `IA32_VMX_PROCBASED_CTLS` does not allow
+it, in which case the offset writes are harmless no-ops. TSC scaling is not used,
+so migrating a running guest to a host with a different TSC frequency is out of
+scope.
+
+## AP virtualisation
+
+`efi/smp.c` locates `EFI_MP_SERVICES_PROTOCOL`, allocates a private VMXON region,
+VMCS and host stack for each AP, and runs a start-up procedure on every AP that
+does `vmx_enable` + `vmx_setup_vmcs` + `aria_loader_apply_host_state` +
+`vmx_do_launch` on itself. Each AP keeps executing firmware code but is a guest
+from that point on. Every AP inherits the BSP EPT, EPTP, MSR bitmap and control
+settings through a `CopyMem` of `VMM_STATE`, so all processors share one EPT.
+
+APs are launched before the BSP, so a failure is reported while the machine is
+still in a known state.
+
+Two things made this possible, and both were prerequisites rather than plumbing:
+
+- The host state had to be installed at launch time, not at the handoff. An AP
+  VMCS must point at the relocated image, and once an AP has launched it cannot
+  repair its own VMCS, because the only correct host state is the one that would
+  already be too late to install. `aria_loader_snapshot()` runs at the end of
+  setup, and `aria_loader_apply_host_state()` takes a `VMM_STATE*` so it can be
+  applied per-VMCS.
+- The launch does not go through `vmx_launch()`, which writes to the UEFI console
+  and is not safe to call concurrently from several APs. The AP procedure calls
+  `vmx_do_launch()` directly and reports on serial.
+
+**Unverified, and the riskiest thing in the tree.** `StartupAllAPs` is called with
+a zero timeout; `vmx_setup_vmcs()` still writes to serial, so AP output can
+interleave; and an AP returning to the firmware MP dispatch code *as a guest* has
+never been observed. If a first hardware run hangs, disabling this is the first
+thing to try.
+
+## EPT memory typing
+
+`mtrr_is_wb()` used to return UC for any address not covered by a variable MTRR.
+On real firmware `IA32_MTRR_DEF_TYPE` is normally WB and system RAM is
+deliberately left uncovered â€” the variable registers exist to mark MMIO holes UC.
+So the whitelist marked every byte of RAM uncached, which is why UEFI services
+(USB, GOP) hung: their DMA buffers were mapped uncached.
+
+Uncovered addresses now take the MTRR default type, which is what SDM Vol 3
+11.11.2.1 specifies. The builder counts the resulting page types and prints them,
+so a hardware run can confirm the fix instead of assuming it:
+
+    [+] EPT typing: N WB pages, M UC pages
+
+A WB count of 0 means the typing is still wrong.
+
+Residual risk: a 1 GB page that spans an MMIO hole lying strictly inside it is
+typed from its two endpoints. Firmware normally covers MMIO with UC variable
+MTRRs, which the endpoint checks do catch, but this is not a general
+MTRR-overlap resolution.
 
 ## Nested VMX (excluded)
 
@@ -97,37 +270,58 @@ dispatcher into `vmm_handle_exit`, adding the missing merge-table fields, adding
 guest register context switching, tracking VMCS launch state, and re-enabling the
 VMX CPUID bit. It is a Phase 2 project, not a flag flip.
 
+## Not implemented
+
+| Gap | Impact |
+|---|---|
+| **Interrupt / APIC virtualisation** | No virtual interrupt delivery, no TPR shadow, no posted interrupts, no APIC-access page. |
+| **Timers / preemption** | No VMX-preemption timer, no interrupt-window exiting. A guest that masks interrupts and spins is never preempted. |
+| **IOMMU / VT-d** | No DMA remapping; devices DMA against host physical addresses, bypassing the EPT. |
+| **Secure Boot signing** | `mok/` holds a self-signed public certificate. There is no private key in the repository and no signing step in any script. MOK is a shim concept and cannot authorize a firmware-launched UEFI application, so the current path is incomplete. |
+| **Testing** | No unit tests and no guest-side test image. CI builds only. |
+| **Nested VMX** | See above. |
+
 ## Security
 
-Aria is not a security boundary, and as it stands it is not even a reliable
-isolation layer. Read this before running it on hardware you care about.
+Aria is not a security boundary, and as it stands it is not a reliable isolation
+layer either. Read this before running it on hardware you care about.
 
-- **The guest can read and write hypervisor memory.** The EPT is a full identity
-  map with read, write and execute set on every entry, and hypervisor-memory
-  hiding is not implemented. The guest can therefore rewrite the VMCS region, the
-  EPT tables, the MSR bitmap, the host stack and the exit stub.
-- **The host uses the guest's IDT and GDT.** `HOST_IDTR_BASE` and `HOST_GDTR_BASE`
-  are captured from the live machine, and no private tables exist. Any host-side
-  fault vectors through memory the guest owns.
+- **Hypervisor memory is protected but not isolated.** VMM pages are no-access in
+  the EPT, so a guest write takes an EPT violation and halts with the GPA named.
+  That is integrity and diagnosis, not containment: the halt is a denial of
+  service, and the exit path still trusts guest state.
+- **The host no longer uses the guest's IDT and GDT.** `efi/loader.c` builds a
+  private GDT/TSS and an IDT whose every vector halts visibly.
 - **No DMA isolation.** No IOMMU, and the guest has native port I/O.
-- **Unvalidated guest state could halt the host.** Guest `CR4` writes are now
-  masked against `CR4_FIXED0`/`CR4_FIXED1`, which removes one path to a failed VM
-  entry; the general class of problem remains.
+- **Unvalidated guest state could halt the host.** Guest `CR4` writes are masked
+  against `CR4_FIXED0`/`CR4_FIXED1`, which removes one path to a failed VM entry;
+  the general class of problem remains.
 
 ## Build
 
 **Verified.** A clean rebuild (build output deleted, then rebuilt) completes with
-zero errors and produces:
+no errors and no warnings from Aria's own sources, and produces:
 
 ```
-AriaEfi.efi   26,624 bytes
-PE32+, machine 0x8664, subsystem 10 (EFI Application), entry RVA 0x1010
-SHA-256  2C80659EE8FA60B6FADC0E714CD45DB5818BF17794D03199CCDD522DAB865376
+AriaEfi.efi   37,376 bytes
+PE32+, machine 0x8664, subsystem 10 (EFI Application), entry RVA 0x1020
+SHA-256  AA905D94A0D163DDBEE250BCDE1F78AFEF87F12A1E419F904CFFC3C2A5ED858A
 ```
 
-on Visual Studio 2026 (18.3) with MSVC 14.50.35717, against EDK2
+on Visual Studio 18 Community with MSVC 14.50.35717, against EDK2
 `edk2-stable202411`, with NASM 2.16.03. Repeating the build produces a
-byte-identical image.
+byte-identical image â€” checked by deleting `Build\Aria` and rebuilding.
+
+The only output in the log that says "warning" is EDK2's own command line passing
+`/GS` and `/GL` twice (`D9025: overriding '/GS' with '/GS-'`, and the same for
+`/GL`) on every module in the tree, Aria's included. It is not a diagnostic about
+this code and it appears identically for unmodified MdePkg libraries.
+
+An earlier revision of this document recorded a 26,624-byte image with SHA-256
+`2C80â€¦5376`. That was true of the tree before EPT protection, the loader and AP
+bring-up landed, and was left in place through three commits that changed the
+image. The numbers above are the ones that match the current source; regenerate
+them rather than trusting a remembered hash.
 
 | Item | State |
 |---|---|
@@ -142,8 +336,9 @@ byte-identical image.
 
 ### Not verified
 
-**Aria has never been run.** Every claim above is build-level only. No part of
-this document reflects an actual `VMLAUNCH` on hardware.
+**Aria has never been run.** Every claim above is build-level or
+source-inspection only. No part of this document reflects an actual `VMLAUNCH` on
+hardware, and several of the risks listed here can only be settled by one.
 
 ## Code audit
 
@@ -153,7 +348,7 @@ The VMCS layer was audited against the Intel SDM rather than assumed correct.
 
 - All VMCS field encodings in `vmm/vmcs.h` (~100 constants) match the SDM
   scheme: width in bits 14:13, access type in 11:10, index in 9:1. Includes the
-  easy-to-miss ones — `VMCS_LINK_PTR` at 0x2800 as 64-bit *guest* state,
+  easy-to-miss ones â€” `VMCS_LINK_PTR` at 0x2800 as 64-bit *guest* state,
   `GUEST_PHYS_ADDR` at 0x2400, the reserved gap at 0x482C correctly skipped
   before `PREEMPT_TIMER` at 0x482E, and the CET fields at 0x6828/0x6C18.
 - Exit-reason constants 0-64 match the SDM.
@@ -165,16 +360,25 @@ The VMCS layer was audited against the Intel SDM rather than assumed correct.
 - `vmx_adjust_controls()` uses the CR0_FIXED0/FIXED1 convention
   `(desired | must_be_1) & may_be_1`, which is correct.
 - The control set is coherent: proc-based bit 28 (use MSR bitmaps) is enabled
-  and `VMCS_MSR_BITMAP` is programmed; the bitmap is all zeros, so MSRs pass
-  through and no MSR exits occur. Secondary controls enable EPT and VPID.
-  Pin-based requests no external-interrupt or NMI exiting, so the guest keeps
-  its own interrupts.
+  and `VMCS_MSR_BITMAP` is programmed; the bitmap intercepts writes to the eight
+  MSRs VM entry reloads from the VMCS and lets every read and every other MSR run
+  natively. Secondary controls enable EPT and VPID. Pin-based requests no
+  external-interrupt or NMI exiting, so the guest keeps its own interrupts.
 - `VMCS_VMCS_LINK_PTR` is 0xFFFFFFFFFFFFFFFF, required when VMCS shadowing is
   off.
+- `exit_stub.asm` pushes fifteen registers plus one 8-byte pad, which is exactly
+  the `GUEST_REGS` layout in `vmm/vmm.h` including the unused `rsp` slot, and
+  leaves `rsp` 16-byte aligned at the `call` so the x64 ABI is satisfied.
+  `handle_cr_access` knows the `rsp` slot is not a real guest `RSP` and reads it
+  from the VMCS instead.
+- `handle_msr_write()` validates `IA32_EFER` before writing it: it runs in host
+  context, so an unvalidated value would `#GP` the hypervisor rather than the
+  guest. A guest attempt to clear `LMA` or set a reserved bit is reflected back
+  as a guest `#GP`, and the instruction is not advanced.
 
-### Fixed in this pass
+### Fixed in earlier passes
 
-- `vmcs_validate_host_state()` was dead code — 95 lines of SDM 26.2 host-state
+- `vmcs_validate_host_state()` was dead code â€” 95 lines of SDM 26.2 host-state
   checks that nothing called. It now runs at the top of `vmx_launch()`, so a
   host-state violation prints a specific message before the launch attempt. It
   is deliberately report-only: the build has not been run on hardware, and a
@@ -182,234 +386,26 @@ The VMCS layer was audited against the Intel SDM rather than assumed correct.
   otherwise work.
 - The VM-instruction error table printed on launch failure mislabelled codes 7
   and 8 (they are VMREAD/VMWRITE errors, not control/host-state errors),
-  invented a meaning for 9, and omitted 28 and 29 — the two codes a broken
+  invented a meaning for 9, and omitted 28 and 29 â€” the two codes a broken
   VMLAUNCH actually returns. It now matches SDM Vol 3C Table 30-1.
+
+### Fixed in this pass
+
+- `aria_loader_finalize()` re-copied the whole image at the handoff. Because the
+  relocated copy is the running hypervisor from the first VM exit onward, that
+  overwrote live state with a snapshot frozen at setup: exit counters and the
+  accumulated TSC offset jumped backwards, and the `finalized` flag it had just
+  set was overwritten by the copy, so the idempotence check never held. It now
+  records the handoff and verifies `HOST_RIP`/`HOST_CR3` instead of copying.
+- The `ExitBootServices` hook guarded on `g_loader.finalized` in *its* image, but
+  `aria_loader_finalize()` runs in the relocated copy and updates a different
+  object, so the guard was dead and every retry re-issued the hypercall. The flag
+  now lives on the hook's side.
+- `main.c` logged `"[*] EPT hiding SKIPPED (debug)"` at a point where hiding had
+  not yet happened and was then performed a few dozen lines later, so the log
+  claimed the opposite of what the code did.
 
 ### Not audited
 
 `ept_init.c` beyond the identity-map construction and MTRR typing, and the
 assembly beyond the register-save order against `GUEST_REGS`.
-### Fixed after the audit: EPT memory typing
-
-`mtrr_is_wb()` returned UC for any address not covered by a variable MTRR. On
-real firmware `IA32_MTRR_DEF_TYPE` is normally WB and system RAM is deliberately
-left uncovered — the variable registers exist to mark MMIO holes UC. So the
-whitelist marked every byte of RAM uncached. That is why `main.c` describes the
-EPT as "ALL-UC", and why UEFI services (USB, GOP) hung: their DMA buffers were
-mapped uncached.
-
-Uncovered addresses now take the MTRR default type, which is what SDM Vol 3
-11.11.2.1 specifies. The builder also counts the resulting page types and prints
-them, so a hardware run can confirm the fix instead of assuming it:
-
-    [+] EPT typing: N WB pages, M UC pages
-
-A WB count of 0 means the typing is still wrong.
-
-Residual risk: a 1GB page that spans an MMIO hole lying strictly inside it is
-typed from its two endpoints. Firmware normally covers MMIO with UC variable
-MTRRs, which the endpoint checks do catch, but this is not a general
-MTRR-overlap resolution.
-## Features
-
-### MSR interception
-
-The MSR bitmap (`vmm/msr_bitmap.c`) intercepts writes to the eight MSRs whose
-values VM entry reloads from the VMCS:
-
-    IA32_SYSENTER_CS / ESP / EIP, IA32_DEBUGCTL, IA32_PAT,
-    IA32_EFER, IA32_FS_BASE, IA32_GS_BASE
-
-Without interception a guest `WRMSR` to any of these succeeds on the hardware and
-is then silently reverted at the next VM entry, because the CPU reloads the MSR
-from a VMCS field that was never updated. Reads are deliberately not intercepted:
-they return the real MSR, which the handler keeps identical to the VMCS, so the
-fast path stays exit-free.
-
-`handle_msr_write()` validates before touching hardware. It runs in host context,
-so a value that would raise #GP on WRMSR would fault the hypervisor rather than
-the guest; a guest attempt to change EFER.LMA or set a reserved EFER bit is
-reflected back as a guest #GP instead.
-
-Known gap: `swapgs` changes GS base without an MSR write and is not
-interceptable. Whether VM exit independently saves the guest GS base is **not
-verified here**. If it does not, a guest that relies on `swapgs` would need the
-GS base captured and restored around each exit, and that needs hardware testing
-to establish.
-
-### Hypercall ABI
-
-The guest issues `VMCALL` with the call number in RAX; results come back in
-registers. The interface is discoverable rather than hardcoded — CPUID leaf
-0x40000001 reports the ABI version, a feature bitmap, and the highest
-implemented call.
-
-    leaf 0x40000000  vendor "AriaAriaAria", EAX = highest leaf (0x40000002)
-    leaf 0x40000001  ABI version (EAX), feature flags (EBX), max call (ECX)
-    leaf 0x40000002  live VM-exit counter (EDX:EAX)
-
-    call 0  VERSION      RBX = ABI version, RCX = "Aria"
-    call 1  EXIT_COUNT   RBX = total VM exits since launch
-    call 2  EXIT_REASON  in RCX = reason; RBX = count for that reason
-    call 3  EPT_TYPING   RBX = WB pages, RCX = UC pages
-
-An unknown call returns RAX = 1.
-
-This is the point of the interface: a guest can confirm the hypervisor is really
-there, how many exits it has taken, and whether its RAM is mapped cacheable —
-rather than trusting the hypervisor'"'"'s own log.
-
-### Exit statistics
-
-`aria_exit_reason_counts[65]` counts exits per reason. `aria_exit_log[16]` keeps
-the first sixteen in order, so a crash shows the sequence that led to it. Both
-are readable from the guest through hypercall 2.
-### Surviving ExitBootServices — implemented, unverified
-
-`efi/loader.c` keeps a copy of the whole image in `EfiRuntimeServicesCode` and
-gives the host its own state in `EfiRuntimeServicesData`:
-
-    image copy   EfiRuntimeServicesCode, allocated below 4GB
-    host CR3     identity map, 0-16GB, 2MB pages
-    host GDT     flat 64-bit code/data plus a TSS descriptor
-    host TSS     104-byte, RSP0 = top of the host stack
-    host IDT     every vector -> host_fault_halt
-
-No relocation engine is needed. The image is position independent, which was
-verified rather than assumed: there is no `.reloc` section and no `BASERELOC`
-data directory, `ImageBase` is 0, and a scan of `.data` found no absolute
-pointers into the image — the four 8-byte values that initially looked like
-pointers sit inside ASCII string literals.
-
-The handoff goes through a hypercall because the hook executes as the guest and
-cannot `VMWRITE`. `gBS->ExitBootServices` is wrapped; the wrapper issues
-`VMCALL(ARIA_HC_FINALIZE)`, which exits to root, where `aria_loader_finalize()`
-copies the live image (including current `.data`/`.bss`) into the runtime buffer
-and repoints `HOST_RIP`, `HOST_CR3`, `HOST_GDTR_BASE`, `HOST_IDTR_BASE`,
-`HOST_TR_SEL` and `HOST_TR_BASE`. The next VM exit enters the relocated stub.
-
-The exit stub now executes `cli` on entry so the handler cannot be interrupted in
-host context; VM entry restores the guest `RFLAGS` from `GUEST_RFLAGS`, so the
-guest `IF` is unaffected.
-
-The host stack is allocated below 4GB, because the host identity map covers
-0-16GB and the exit handler runs on that stack.
-
-**Unverified.** None of this has run. A hardware run needs to confirm three
-things: that the image really is position independent at a nonzero base; that the
-host CR3 and GDT are accepted on the first exit after the handoff; and that no
-relocated path touches `gBS`/`gST`, which are freed at that point.
-### TSC offsetting — implemented, unverified
-
-The processor-based control "use TSC offsetting" (bit 3) is now enabled and
-`vmm_handle_exit` charges the time it spends in root context to the hypervisor:
-`VMCS_TSC_OFFSET` accumulates `-(tsc_out - tsc_in)`, so the guest's `RDTSC` does
-not advance while the guest is not running. The accumulated value is readable
-through hypercall 5 (`TSC_OFFSET`).
-
-`vmx_adjust_controls` masks bit 3 off if `IA32_VMX_PROCBASED_CTLS` does not
-allow it, in which case the offset writes are harmless no-ops.
-
-### Readable panics
-
-The four fatal paths (triple fault, EPT violation, EPT misconfiguration,
-unhandled exit) previously logged detail to serial and only a short string to
-VGA. A desktop usually has no serial port, so they now dump exit reason,
-qualification, guest `RIP`, `RSP`, `GPA` and the exit count to the VGA text
-buffer as well, and halt. This is the intended way to find out what went wrong on
-a first hardware run.
-### EPT protection of hypervisor memory — implemented, unverified
-
-`ept_hide_range` clears read/write/execute on the 4KB EPT entries covering the
-hypervisor's own pages, so the guest faults on any access instead of being able to
-read or overwrite the hypervisor. This is integrity, not concealment: the access
-takes an EPT violation and the panic dump names the GPA.
-
-Protected: VMXON region, VMCS region, MSR bitmap, host stack, the relocated image,
-and the loader's host CR3/GDT/IDT pages.
-
-Two bugs had to be fixed first, both of which would only have surfaced on
-hardware:
-
-- The split pool was a 4MB static array in `vmm/ept.c`, that is, in the image's
-  BSS. Splitting a 2MB page allocated the new page table from there, so the EPT
-  would have pointed at memory the guest frees at `ExitBootServices`. It is now
-  allocated as `EfiRuntimeServicesData` and handed to `ept_set_pool()`.
-- `ept_split_2mb_to_4kb` hardcoded memory type WB for all 512 entries instead of
-  preserving the parent's, so splitting a single page inside an uncached region
-  would have silently made the whole region cacheable.
-
-Deliberately not protected: the EPT's own page tables. `ept_walk` uses an entry's
-read bit as its present test, so hiding the GPAs that hold the tables interferes
-with the walk that would have to do the hiding. Remaining work.
-
-Splitting also makes `ept_wb_pages`/`ept_uc_pages` (hypercall 3) stale for the
-split regions, because those counts are accumulated over 2MB pages at build time.
-
-### AP virtualisation — dependency found, not started
-
-Item 2 has a real ordering problem that is not obvious from the roadmap. An AP's
-VMCS host state must point at the relocated image, because that is the only copy
-that survives the handoff. But the relocated image is not valid until
-`aria_loader_finalize()` copies it, which happens at `ExitBootServices`. An AP
-launched before that would jump to uninitialised memory on its first exit, and an
-AP cannot fix its own VMCS afterwards because the only correct host state is the
-one that is already too late to install.
-
-The fix is to snapshot the image once at the end of setup as well as at the
-handoff, so the relocated stub is valid from launch time onward, and to apply the
-host state per-VMCS at AP launch instead of only to the BSP at handoff. That is a
-prerequisite refactor in `efi/loader.c` and has not been done.
-### EPT capability validation — implemented
-
-`ept_build_identity_map_minimal` now reads `IA32_VMX_EPT_VPID_CAP` (MSR 0x48C)
-before building and refuses with a named reason if the CPU cannot do 4-level EPT
-walks (bit 6), WB memory type (bit 14) or 2MB pages (bit 16). Previously the
-capability MSR was never read at all, so an unsupported configuration surfaced as
-an opaque VM-entry failure.
-
-The 4-512GB window is mapped with 1GB pages, which needs bit 17. If that bit is
-clear those entries are now omitted with a loud message instead of being emitted
-as an EPT misconfiguration, and memory above 4GB is left unmapped. That is a
-degraded state, not a good one, but it is honest and diagnosable; every CPU with
-EPT in practice supports 1GB pages.
-### AP virtualisation — implemented, unverified
-
-`efi/smp.c` locates `EFI_MP_SERVICES_PROTOCOL`, allocates a private VMXON region,
-VMCS and host stack for each AP, and runs a start-up procedure on every AP that
-does `vmx_enable` + `vmx_setup_vmcs` + `aria_loader_apply_host_state` +
-`vmx_do_launch` on itself. Each AP keeps executing firmware code but is a guest
-from that point on. Every AP inherits the BSP EPT, EPTP, MSR bitmap and control
-settings through a `CopyMem` of `VMM_STATE`, so all processors share one EPT.
-
-APs are launched before the BSP, so a failure is reported while the machine is
-still in a known state.
-
-Two things made this possible, and both were prerequisites rather than plumbing:
-
-- The host state had to be installed at launch time, not at the handoff. An AP
-  VMCS must point at the relocated image, but that image only became valid at
-  `ExitBootServices`; and once an AP has launched it cannot repair its own VMCS,
-  because the only correct host state is the one that would already be too late to
-  install. `aria_loader_snapshot()` is now called at the end of setup as well as at
-  the handoff, and `aria_loader_apply_host_state()` takes a `VMM_STATE*` so it can
-  be applied per-VMCS.
-- The launch does not go through `vmx_launch()`, which writes to the UEFI console
-  and is not safe to call concurrently from several APs. The AP procedure calls
-  `vmx_do_launch()` directly and reports on serial.
-
-**Unverified, and the riskiest thing in the tree.** `StartupAllAPs` is called with
-a zero timeout; console output is avoided but not proven safe; and an AP returning
-to the firmware MP dispatch code *as a guest* has never been observed. If a first
-hardware run hangs, disabling this is the first thing to try.
-### EPT own page tables — protected
-
-`ept_protect_own_tables` walks the EPT and hides the GPAs of every page table it
-finds (PML4, PDPT, PD and any split PT), plus the whole split pool. It runs last,
-because hiding a page can itself split a 2MB entry and allocate a page table from
-the pool.
-
-This closes the gap recorded above. It is safe for two reasons: hiding a leaf
-entry for one GPA does not disturb the entries used to walk to any other GPA, and
-the CPU walks the EPT through physical addresses rather than through the EPT, so
-an active page table can have its own GPA hidden without affecting the walk.

@@ -8,7 +8,9 @@
 //
 // The fix: keep a copy of the whole image in EfiRuntimeServicesCode (which the
 // OS must preserve), give the host its own CR3, GDT, IDT and TSS in
-// EfiRuntimeServicesData, and repoint the VMCS at them just before the handoff.
+// EfiRuntimeServicesData, and point the VMCS at them at launch time rather than
+// at the handoff — an AP has to launch with the relocated host state already
+// installed, because it cannot repair its own VMCS afterwards.
 //
 // No relocation engine is needed. The image is verified position independent:
 // it has no .reloc section, no BASERELOC data directory, ImageBase is 0, and a
@@ -198,19 +200,42 @@ void aria_loader_apply_host_state(VMM_STATE* state) {
 }
 
 // Runs in root context (hypercall 4). The host state was already installed at
-// launch, so all this has to do is refresh the image with the final globals.
-// Idempotent: the flag is set before the copy, so the relocated copy also
-// reports itself as finalised.
+// launch, so there is nothing left to relocate; what is left is to *check* that
+// it really does point at runtime-preserved memory, and record the handoff.
+//
+// It deliberately does not re-copy the image. This code runs from the relocated
+// copy, which has been the running hypervisor since the first VM exit, so copying
+// the original over it would overwrite live state with a snapshot frozen at setup
+// time: the exit counters, the accumulated TSC offset and g_vmm would all jump
+// backwards, and the finalized flag set just below would be overwritten by the
+// copy it had just made — defeating the idempotence check that is supposed to
+// stop this running twice. The single snapshot at the end of setup is the
+// correct one.
 void aria_loader_finalize(void) {
     if (g_loader.finalized) return;
     if (!g_loader.prepared || g_loader.image_new_base == 0) return;
     g_loader.finalized = TRUE;
 
-    aria_loader_snapshot();
+    UINT64 rip = vmcs_read64(VMCS_HOST_RIP);
+    UINT64 cr3 = vmcs_read64(VMCS_HOST_CR3);
+    UINT64 lo  = g_loader.image_new_base;
+    UINT64 hi  = lo + g_loader.image_size;
 
-    serial_print("[+] loader: runtime image refreshed, RIP=0x");
-    serial_print_hex((UINT64)(UINTN)vm_exit_stub + g_loader.delta);
+    serial_print("[+] loader: handoff, HOST_RIP=0x");
+    serial_print_hex(rip);
+    serial_print(" HOST_CR3=0x");
+    serial_print_hex(cr3);
     serial_print("\n");
+
+    // A host RIP outside the runtime copy, or a host CR3 that is not the identity
+    // map, means the first exit after the handoff lands in memory the OS is about
+    // to reuse. Say so now, on the record, instead of faulting later unexplained.
+    if (rip < lo || rip >= hi) {
+        serial_print("[!] loader: HOST_RIP outside the runtime image - handoff unsafe\n");
+    }
+    if (cr3 != g_loader.host_cr3_pa) {
+        serial_print("[!] loader: HOST_CR3 is not the host identity map - handoff unsafe\n");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,8 +247,17 @@ void aria_loader_finalize(void) {
 // ---------------------------------------------------------------------------
 static EFI_EXIT_BOOT_SERVICES m_orig_exit_boot_services = NULL;
 
+// Set in this image's own .data. aria_loader_finalize() runs in the relocated
+// copy and so cannot clear or set a flag that this code can see: g_loader here
+// and g_loader there are two different objects. The guard therefore has to live
+// on this side. ExitBootServices may legitimately be called more than once (the
+// OS retries with a fresh map key if the memory map changed), and the handoff
+// only needs recording once.
+static BOOLEAN m_finalize_sent = FALSE;
+
 static EFI_STATUS EFIAPI aria_exit_boot_services(EFI_HANDLE ImageHandle, UINTN MapKey) {
-    if (g_loader.active && !g_loader.finalized) {
+    if (g_loader.active && !m_finalize_sent) {
+        m_finalize_sent = TRUE;
         aria_vmcall(ARIA_HC_FINALIZE);
     }
     return m_orig_exit_boot_services(ImageHandle, MapKey);
