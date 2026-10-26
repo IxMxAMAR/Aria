@@ -8,9 +8,10 @@
 //   0xC00  write, MSRs 0xC0000000-0xC0001FFF
 //
 // A set bit causes a VM exit for that MSR; a clear bit lets the access run
-// natively on the hardware. Only the write side is populated here: reads return
-// the real MSR, which handle_msr_write() keeps in sync with the VMCS, so a read
-// needs no exit.
+// natively on the hardware. The write side is populated for the MSRs that VM
+// entry reloads from the VMCS, which handle_msr_write() keeps in sync, so reads
+// of those need no exit. The read side is populated only in anonymous mode, for
+// the VMX capability block — see the note at the end of aria_build_msr_bitmap().
 //
 // Why any of this is necessary: VM entry reloads several MSRs *from the VMCS*
 // (IA32_EFER via entry control bit 15, and FS/GS base, SYSENTER and DEBUGCTL
@@ -55,6 +56,22 @@ static void msr_bitmap_set_write(uint8_t* bitmap, uint32_t msr) {
     }
 }
 
+static void msr_bitmap_set_read(uint8_t* bitmap, uint32_t msr) {
+    uint32_t idx;
+    if ((msr & 0xC0000000u) == 0xC0000000u) {
+        idx = msr & 0x1FFFu;
+        bitmap[MSR_BITMAP_READ_HIGH + (idx >> 3)] |= (uint8_t)(1u << (idx & 7u));
+    } else if (msr <= 0x1FFFu) {
+        idx = msr;
+        bitmap[MSR_BITMAP_READ_LOW + (idx >> 3)] |= (uint8_t)(1u << (idx & 7u));
+    }
+}
+
+// VMX capability MSRs, IA32_VMX_BASIC (0x480) through IA32_VMX_VMFUNC (0x491).
+#define VMX_MSR_FIRST        0x480u
+#define VMX_MSR_LAST         0x491u
+#define MSR_IA32_FEATURE_CONTROL 0x3Au
+
 // Populate a 4KB, 4KB-aligned MSR bitmap. Everything not listed above passes
 // through to the hardware, which is the fast path.
 void aria_build_msr_bitmap(void* bitmap) {
@@ -64,5 +81,20 @@ void aria_build_msr_bitmap(void* bitmap) {
     }
     for (uint32_t i = 0; i < ARIA_SYNCED_MSR_COUNT; i++) {
         msr_bitmap_set_write(bm, aria_synced_msrs[i]);
+    }
+
+    // Anonymous mode is the one case where reads have to be intercepted too.
+    // Masking CPUID.1:ECX[5] says "this processor has no VMX", but the VMX
+    // capability MSRs would still answer with real values, and that combination
+    // — CPUID says absent, RDMSR 0x480 returns a valid VMCS revision ID — does
+    // not occur on real hardware. It is a stronger tell than announcing, so the
+    // reads are trapped and the handler delivers the #GP a CPU without VMX would
+    // give. IA32_FEATURE_CONTROL is trapped because its bit 2 says VMXON is
+    // enabled, which contradicts the same CPUID.
+    if (aria_identity == ARIA_IDENTITY_ANONYMOUS) {
+        for (uint32_t msr = VMX_MSR_FIRST; msr <= VMX_MSR_LAST; msr++) {
+            msr_bitmap_set_read(bm, msr);
+        }
+        msr_bitmap_set_read(bm, MSR_IA32_FEATURE_CONTROL);
     }
 }

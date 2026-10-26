@@ -137,6 +137,18 @@ worth being precise about what it buys.
 | CPUID.1:ECX[31] | set | cleared |
 | `VMCALL` | hypercall ABI | `#UD`, RIP not advanced |
 
+### Closed in this pass
+
+| Was | Now |
+|---|---|
+| `RDMSR 0x480`–`0x491` returned real capability values while CPUID said VMX was absent | the read is intercepted and raises `#GP`, which is what a processor with no VMX does — those registers do not exist |
+| `IA32_FEATURE_CONTROL` bit 2 said VMXON was enabled | the read is intercepted; bits 1 and 2 read as zero, bit 0 (lock) is left as firmware set it |
+| `VMCALL(4)` reached `aria_loader_finalize()` | gated on `ARIA_HC_FINALIZE_TOKEN` in RCX, so probing VMCALL cannot reach it |
+
+The first two were worth more than the vendor string. "CPUID says no VMX, RDMSR
+says here is a VMCS revision ID" is a pair no real processor produces, so masking
+one without the other was a *stronger* tell than announcing.
+
 ### What it does not remove — the evidence
 
 Each row is a working detector against the current tree, with what it would cost
@@ -146,12 +158,9 @@ calling it one would be dishonest.
 | Evidence | Why it survives | Cost to close |
 |---|---|---|
 | **`CPUID` timing** | CPUID *always* causes a VM exit in non-root operation — there is no control bit for it. Each exit costs three VMCS accesses (read RIP, write RIP, write TSC offset) plus the handler. | Not closable with VMX. Only reducible: shorten the exit path. |
-| **VMX MSRs** | MSR *reads* are not intercepted at all, so `RDMSR 0x480` (`IA32_VMX_BASIC`) returns a valid VMCS revision ID and `IA32_FEATURE_CONTROL` bit 2 still says VMXON is enabled. | Low. Extend the bitmap to the read side and return "not supported" values: ~60 lines in `msr_bitmap.c` plus a read handler. |
-| **The contradiction** | CPUID says VMX absent while the MSRs say present. No real CPU produces that pair, so masking one without the other is a *stronger* tell than announcing. | Same fix as above, plus a decision about what `IA32_FEATURE_CONTROL` should read and whether writes to it should fault. |
 | **`CR4` and MSR write latency** | `CR4_GUEST_HOST_MASK` is `CR4_VMXE` and eight MSRs are write-intercepted, so each write exits and can be timed. | Medium, and it fights correctness: `handle_msr_write` exists precisely because those writes would otherwise be reverted at the next entry. |
-| **TSC behaviour** | `VMCS_TSC_OFFSET` freezes the guest TSC while in root context, so RDTSC diverges from any reference clock by roughly the time spent in the hypervisor. The accumulator is also a non-atomic global shared by every AP. | Medium: TSC scaling, plus a per-CPU accumulator. |
+| **TSC behaviour** | `VMCS_TSC_OFFSET` freezes the guest TSC while in root context, so RDTSC diverges from any reference clock by roughly the time spent in the hypervisor. The accumulator is shared by every processor: the update is atomic now, so no update is lost, but each core still adds its own time to the same total and then writes that total to its own VMCS, so the correction is over-applied once the APs are live. | Medium: per-CPU offsets (a per-CPU GS block is the usual mechanism) plus TSC scaling. |
 | **EPT holes** | Hypervisor pages are no-access in the EPT, so a detector that walks guest-physical RAM takes an EPT violation — and `ARIA_STRICT_EXITS` halts the machine. That is the loudest possible answer. | High, and it trades directly against EPT protection: faking reads of those pages needs an emulation path that does not exist. |
-| **`VMCALL(4)`** | `ARIA_HC_FINALIZE` is still answered in anonymous mode, because the `ExitBootServices` hook needs a root-context entry point. | Low: gate it on a magic register value rather than the call number. |
 | **Interrupts** | Not a leak. Nothing is virtualised — no virtual interrupt delivery, no TPR shadow, no APIC-access page — so interrupt behaviour and latency are native. | — |
 
 ### Cost, measured
@@ -159,7 +168,8 @@ calling it one would be dishonest.
 Compiling the announcement out entirely was 512 bytes smaller (36,864 against
 37,376). Keeping both paths and selecting at runtime costs 512 bytes over the
 announce-only build (37,888 against 37,376), because the vendor leaf, the ABI
-leaf and the hypercall path are all still in the image.
+leaf and the hypercall path are all still in the image. Closing the MSR read leak
+and gating `VMCALL(4)` cost nothing measurable: the image is still 37,888 bytes.
 
 The honest summary: anonymous mode is cheap and it defeats a casual `cpuid`
 check. It does not defeat a detector that measures CPUID cost, which is the first
@@ -362,7 +372,7 @@ no errors and no warnings from Aria's own sources, and produces:
 ```
 AriaEfi.efi   37,888 bytes
 PE32+, machine 0x8664, subsystem 10 (EFI Application), entry RVA 0x1020
-SHA-256  2BCA2A2F29839111E7EC702DC3992E11EFD83C8525EFBFECFA68D7E95E623CBF
+SHA-256  BA073F4BDAFB9B603DD146E754EF48B358F5968C84CFAAAD32C0C4D6ED541516
 ```
 
 on Visual Studio 18 Community with MSVC 14.50.35717, against EDK2
@@ -446,7 +456,7 @@ The VMCS layer was audited against the Intel SDM rather than assumed correct.
   invented a meaning for 9, and omitted 28 and 29 — the two codes a broken
   VMLAUNCH actually returns. It now matches SDM Vol 3C Table 30-1.
 
-### Fixed in this pass
+### Fixed in the previous pass
 
 - `aria_loader_finalize()` re-copied the whole image at the handoff. Because the
   relocated copy is the running hypervisor from the first VM exit onward, that
@@ -461,6 +471,20 @@ The VMCS layer was audited against the Intel SDM rather than assumed correct.
 - `main.c` logged `"[*] EPT hiding SKIPPED (debug)"` at a point where hiding had
   not yet happened and was then performed a few dozen lines later, so the log
   claimed the opposite of what the code did.
+
+### Fixed in this pass
+
+- The exit counters and the TSC-offset accumulator were plain read-modify-writes
+  on globals that every processor touches once the APs are launched, so
+  concurrent exits lost updates. They go through `aria_atomic_add64`
+  (`lock xadd`) now. `aria_exit_count` was also 32-bit while being handed to the
+  guest as `EDX:EAX` (CPUID `0x40000002`) and as a 64-bit hypercall return, so it
+  wrapped silently at 4G exits; it is 64-bit.
+- In anonymous mode the VMX capability MSRs and `IA32_FEATURE_CONTROL` answered
+  with real values while CPUID reported VMX absent. Reads of `0x480`–`0x491` now
+  raise `#GP` and `IA32_FEATURE_CONTROL` reads back with the VMXON bits cleared.
+- `ARIA_HC_FINALIZE` was reachable by any guest that issued `VMCALL(4)`; it now
+  requires `ARIA_HC_FINALIZE_TOKEN` in RCX, in every identity mode.
 
 ### Not audited
 

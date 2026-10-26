@@ -85,12 +85,23 @@ host_fault_halt PROC
     jmp     $
 host_fault_halt ENDP
 
-; aria_vmcall — issue a hypercall with the call number in rcx.
+; aria_vmcall — issue a hypercall with the call number in rcx and the token in rdx.
 ; Returns the hypervisor's status in rax.
 aria_vmcall PROC
     mov     rax, rcx
+    mov     rcx, rdx
     vmcall
     ret
 aria_vmcall ENDP
+
+; aria_atomic_add64 — atomically add rdx to the qword at rcx.
+; Returns the value the location held before the add in rax.
+; The exit counters and the TSC-offset accumulator are shared by every processor
+; once the APs are launched, so the read-modify-write has to be indivisible.
+aria_atomic_add64 PROC
+    mov     rax, rdx
+    lock xadd qword ptr [rcx], rax
+    ret
+aria_atomic_add64 ENDP
 
 END

@@ -32,7 +32,7 @@ ARIA_LOADER g_loader = {0};
 // Defined in vmm/asm/exit_stub.asm
 extern void   vm_exit_stub(void);
 extern void   host_fault_halt(void);
-extern UINT64 aria_vmcall(UINT64 nr);
+extern UINT64 aria_vmcall(UINT64 nr, UINT64 token);
 
 // How much physical address space the host identity map covers. The relocated
 // image and the host stack both come from AllocateMaxAddress below 4GB, so this
@@ -243,7 +243,8 @@ void aria_loader_finalize(void) {
 //
 // The hook runs as the guest (the OS is the one calling ExitBootServices), so it
 // cannot VMWRITE. It issues a hypercall, which exits to root where the
-// finalisation can touch the VMCS.
+// finalisation can touch the VMCS. The token keeps the call from being reachable
+// by a guest that is merely probing VMCALL.
 // ---------------------------------------------------------------------------
 static EFI_EXIT_BOOT_SERVICES m_orig_exit_boot_services = NULL;
 
@@ -258,7 +259,7 @@ static BOOLEAN m_finalize_sent = FALSE;
 static EFI_STATUS EFIAPI aria_exit_boot_services(EFI_HANDLE ImageHandle, UINTN MapKey) {
     if (g_loader.active && !m_finalize_sent) {
         m_finalize_sent = TRUE;
-        aria_vmcall(ARIA_HC_FINALIZE);
+        aria_vmcall(ARIA_HC_FINALIZE, ARIA_HC_FINALIZE_TOKEN);
     }
     return m_orig_exit_boot_services(ImageHandle, MapKey);
 }

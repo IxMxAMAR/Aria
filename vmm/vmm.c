@@ -22,8 +22,9 @@ VMM_STATE g_vmm = {0};
 // It does not suppress the *evidence*, and nothing here should be read as
 // claiming otherwise. CPUID always causes a VM exit in non-root operation — there
 // is no control bit to turn it off — so every CPUID costs an exit and the exit is
-// measurable. The VMX MSRs (0x480-0x48F, and IA32_FEATURE_CONTROL) are readable
-// because MSR reads are not intercepted at all. See docs/STATUS.md.
+// measurable. That one cannot be closed. The VMX capability MSRs could be, and in
+// this mode they are masked to match the CPUID (see vmm/msr_bitmap.c).
+// docs/STATUS.md lists what is left.
 uint32_t aria_identity = ARIA_IDENTITY_ANNOUNCE;
 
 // ---------------------------------------------------------------------------
@@ -111,13 +112,20 @@ static void halt_forever(void) {
     for (;;) { extern void _mm_pause(void); _mm_pause(); }
 }
 
-// Global exit counter — readable from EFI main after VMLAUNCH
-volatile uint32_t aria_exit_count = 0;
+// Global exit counter — readable from EFI main after VMLAUNCH. 64-bit because it
+// is exposed to the guest as EDX:EAX (CPUID 0x40000002) and as a 64-bit hypercall
+// return, and a 32-bit counter would wrap silently at 4G exits. Not volatile:
+// concurrent updates go through aria_atomic_add64, and an aligned 64-bit load is
+// already indivisible on x86-64, so a reader cannot see a torn value.
+uint64_t aria_exit_count = 0;
 // Track first 16 exit reasons for debugging
 volatile uint32_t aria_exit_log[16] = {0};
 // Per-reason exit counters, indexed by VM-exit reason 0-64. The log above shows
 // ordering; these show frequency, and the guest reads them via hypercall 2.
-volatile uint64_t aria_exit_reason_counts[65] = {0};
+uint64_t aria_exit_reason_counts[65] = {0};
+
+// vmm/asm/exit_stub.asm — lock xadd, returns the previous value.
+extern uint64_t aria_atomic_add64(uint64_t* target, uint64_t value);
 
 // Accumulated time the guest did not spend running. VMCS_TSC_OFFSET is added to
 // the host TSC to produce the guest's TSC, so subtracting the time spent in the
@@ -188,8 +196,8 @@ static int handle_hypercall(GUEST_REGS* regs) {
     // VMX: #UD, with the guest RIP left on the instruction so the guest's own
     // fault handler reports the right address. ARIA_HC_FINALIZE is the single
     // exception, because the ExitBootServices hook needs a root-context entry
-    // point and a guest cannot VMWRITE for itself. It is harmless if some other
-    // guest issues it: it records the handoff and checks the host state.
+    // point and a guest cannot VMWRITE for itself; it is gated on a token below
+    // so that a guest probing VMCALL cannot reach it either.
     if (aria_identity == ARIA_IDENTITY_ANONYMOUS && nr != ARIA_HC_FINALIZE) {
         inject_exception(6 /* #UD */, 0);
         return 0;
@@ -220,6 +228,12 @@ static int handle_hypercall(GUEST_REGS* regs) {
         // Record the ExitBootServices handoff and verify the host state that was
         // installed at launch. Issued by the hook, which runs as the guest and so
         // cannot VMWRITE for itself. Root context only, which is where this runs.
+        // The token check keeps a guest that is merely probing VMCALL from
+        // reaching it, in every identity mode.
+        if (regs->rcx != ARIA_HC_FINALIZE_TOKEN) {
+            regs->rax = 1;
+            break;
+        }
         aria_loader_finalize();
         break;
     default:
@@ -233,11 +247,12 @@ void vmm_handle_exit(GUEST_REGS* regs) {
     uint64_t tsc_in = AsmReadTsc();
     uint32_t exit_reason = vmcs_read32(VMCS_EXIT_REASON) & 0xFFFF;
 
-    // Log exit reason
-    uint32_t idx = aria_exit_count;
+    // Log exit reason. Once the APs are launched every processor runs this, so
+    // the read-modify-write has to be atomic: a plain ++ loses updates under
+    // contention, and the guest reads these counters through hypercalls 1 and 2.
+    uint64_t idx = aria_atomic_add64((uint64_t*)&aria_exit_count, 1);
     if (idx < 16) aria_exit_log[idx] = exit_reason;
-    aria_exit_count++;
-    if (exit_reason < 65) aria_exit_reason_counts[exit_reason]++;
+    if (exit_reason < 65) aria_atomic_add64(&aria_exit_reason_counts[exit_reason], 1);
 
     switch (exit_reason) {
     case EXIT_REASON_EXCEPTION_NMI: // 0
@@ -320,9 +335,10 @@ void vmm_handle_exit(GUEST_REGS* regs) {
             }
             // VMX is reported as absent: nested VMX is not implemented yet, so a
             // guest that tried VMXON would fail anyway. Re-enable in Phase 2.
-            // Note that this is itself a tell in anonymous mode: IA32_FEATURE_CONTROL
-            // and IA32_VMX_BASIC still say otherwise, because MSR reads are not
-            // intercepted. See docs/STATUS.md, "Anonymous mode".
+            // In anonymous mode the VMX capability MSRs are masked to match (see
+            // vmm/msr_bitmap.c); without that, CPUID saying "no VMX" and RDMSR
+            // 0x480 returning a real revision ID would be a stronger tell than
+            // announcing. See docs/STATUS.md, "Anonymous mode".
             info[2] = (int)((uint32_t)info[2] & ~(1u << 5));
         }
 
@@ -337,6 +353,30 @@ void vmm_handle_exit(GUEST_REGS* regs) {
     case EXIT_REASON_MSR_READ: { // 31
         uint32_t msr = (uint32_t)regs->rcx;
         extern uint64_t __readmsr(uint32_t);
+
+        // Anonymous mode: the VMX capability block and IA32_FEATURE_CONTROL are
+        // intercepted for reading, and both have to agree with the CPUID that
+        // just said VMX is absent. On a processor with no VMX the capability
+        // MSRs do not exist at all, so RDMSR raises #GP rather than returning
+        // zero — do the same, and leave the guest RIP on the instruction.
+        if (aria_identity == ARIA_IDENTITY_ANONYMOUS) {
+            if (msr >= 0x480u && msr <= 0x491u) {
+                inject_exception(13 /* #GP */, 0);
+                break;
+            }
+            if (msr == 0x3Au) { // IA32_FEATURE_CONTROL
+                // Bit 2 (VMXON outside SMX) and bit 1 (VMXON inside SMX) read as
+                // zero on a CPU without VMX. Bit 0 (lock) is left as firmware
+                // set it: "locked, with VMX off" is a normal state, and it is
+                // exactly the state the masked CPUID now describes.
+                uint64_t fc = __readmsr(msr) & ~((1ULL << 2) | (1ULL << 1));
+                regs->rax = fc & 0xFFFFFFFF;
+                regs->rdx = fc >> 32;
+                advance_guest_rip();
+                break;
+            }
+        }
+
         uint64_t val = __readmsr(msr);
         regs->rax = val & 0xFFFFFFFF;
         regs->rdx = val >> 32;
@@ -437,7 +477,13 @@ void vmm_handle_exit(GUEST_REGS* regs) {
     }
 
     // Charge the time spent here to the hypervisor rather than to the guest: the
-    // next VM entry picks up the new offset from the VMCS.
-    aria_tsc_offset -= (int64_t)(AsmReadTsc() - tsc_in);
+    // next VM entry picks up the new offset from the VMCS. The accumulator is
+    // shared by every processor, so the update is atomic — but a shared
+    // accumulator is not the right model once the APs are live: each core adds
+    // its own time to the same total and then writes that total to its own VMCS,
+    // so the correction is applied once per core rather than once per core's own
+    // exits. Per-CPU offsets are the real fix; see docs/STATUS.md.
+    uint64_t delta = AsmReadTsc() - tsc_in;
+    aria_atomic_add64((uint64_t*)&aria_tsc_offset, (uint64_t)(-(int64_t)delta));
     vmcs_write64(VMCS_TSC_OFFSET, (uint64_t)aria_tsc_offset);
 }

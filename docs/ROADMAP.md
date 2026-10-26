@@ -142,10 +142,10 @@ enumerates the remaining tells and the cost of each.
 - **5 — nested VMX.** Not started. Deliberately behind item 0.
 - **6, 7 — breadth.** Not started.
 - **Identity mode.** Announcing stays the default; `AriaEfi.efi anon` suppresses
-  the signature. The cheapest remaining tell to close is the VMX MSR read leak
-  (MSR reads are not intercepted at all, so `RDMSR 0x480` contradicts a CPUID
-  that says VMX is absent). Everything else is listed with a cost in
-  `docs/STATUS.md`.
+  the signature, and the VMX capability MSRs and `IA32_FEATURE_CONTROL` are
+  masked to match, so a guest's CPUID and its RDMSRs agree with each other.
+  Everything that still gives the hypervisor away — CPUID exit timing above all —
+  is listed with a cost in `docs/STATUS.md`.
 - Diagnostics, which is not a roadmap item but has absorbed most of the work:
   fatal exits now dump reason, qualification, `RIP`, `RSP`, GPA and exit count to
   VGA as well as serial, because a desktop with no serial has only the screen.

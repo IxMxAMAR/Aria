@@ -201,6 +201,13 @@ extern VMM_STATE g_vmm;
 #define ARIA_HC_TSC_OFFSET   5
 #define ARIA_HC_MAX          ARIA_HC_TSC_OFFSET
 
+// FINALIZE is the one call that exists in every identity mode, because the
+// ExitBootServices hook needs a root-context entry point and a guest cannot
+// VMWRITE for itself. It is gated on a token in RCX so that a guest probing
+// VMCALL cannot trigger it by guessing the call number. The token is the same
+// little-endian "Aria" the CPUID vendor leaf returns.
+#define ARIA_HC_FINALIZE_TOKEN  0x61697241ULL
+
 // Guest-visible identity, selected at load time (efi/main.c parses the UEFI load
 // options). ANNOUNCE is the documented default: the guest is told the hypervisor
 // is there. ANONYMOUS suppresses the signature, not the evidence — see
