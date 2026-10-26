@@ -163,12 +163,45 @@ static void con_print(const CHAR16* msg) {
 }
 static void step_pause(void) { gBS->Stall(2000000); } // 2 sec
 
+// ---------------------------------------------------------------------------
+// Identity mode, from the UEFI load options.
+//
+//   AriaEfi.efi          -> announce (the documented default)
+//   AriaEfi.efi anon     -> anonymous: no vendor leaf, no hypervisor CPUID bit,
+//                           VMCALL reflected as #UD
+//
+// An unrecognised option is not an error. The default is the announcing mode,
+// because a mode that hides the hypervisor should be something the operator
+// asked for explicitly, not something they get by mistyping.
+// ---------------------------------------------------------------------------
+static void parse_identity(EFI_HANDLE ImageHandle) {
+    EFI_LOADED_IMAGE_PROTOCOL* li = NULL;
+    EFI_GUID lip_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+
+    if (EFI_ERROR(gBS->HandleProtocol(ImageHandle, &lip_guid, (void**)&li))) return;
+    if (li == NULL || li->LoadOptions == NULL) return;
+    if (li->LoadOptionsSize < 4 * sizeof(CHAR16)) return;
+
+    const CHAR16* opt = (const CHAR16*)li->LoadOptions;
+    static const CHAR16 kAnon[4] = { L'a', L'n', L'o', L'n' };
+    for (UINTN i = 0; i < 4; i++) {
+        CHAR16 c = opt[i];
+        if (c >= L'A' && c <= L'Z') c = (CHAR16)(c + (L'a' - L'A'));
+        if (c != kAnon[i]) return;
+    }
+
+    aria_identity = ARIA_IDENTITY_ANONYMOUS;
+    log_write("[*] identity: anonymous (load option \"anon\")\n");
+    con_print(L"[*] Anonymous mode: no vendor leaf, no hypervisor bit\r\n");
+}
+
 EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
     gST_local = SystemTable;
 
     serial_init();
     log_init(ImageHandle);
     log_write("\n\n[Aria] EFI Bootstrap starting...\n");
+    parse_identity(ImageHandle);
     con_print(L"[Aria] Initializing hypervisor...\r\n");
 
     con_print(L"[*] Checking VT-x support...\r\n");

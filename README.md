@@ -15,10 +15,17 @@ of implemented ones.
 
 ## Design principles
 
-**Transparent, not hidden.** Aria announces itself to the guest through the
-hypervisor CPUID leaf and passes real hardware state through. It does not attempt
-to conceal its presence from the guest operating system or from software running
-inside it. A hypervisor that lies to its guest is a different (and much larger)
+**Transparent by default, not hidden.** Aria announces itself to the guest
+through the hypervisor CPUID leaf and passes real hardware state through. It does
+not attempt to conceal its presence from the guest operating system or from
+software running inside it.
+
+**Anonymous on request.** `AriaEfi.efi anon` suppresses the signature: no vendor
+leaf, no hypervisor CPUID bit, and `VMCALL` reflected as `#UD`. That is signature
+suppression, not concealment. CPUID must still cause a VM exit — VMX has no
+control bit for it — the VMX MSRs are still readable, and exit latency is still
+measurable. [docs/STATUS.md](docs/STATUS.md) lists every remaining tell and what
+each would cost to close. Concealment proper is a different and much larger
 project; Aria is not that.
 
 **Fail loudly.** An unhandled VM exit stops with a diagnostic rather than skipping
@@ -28,8 +35,8 @@ five-minute debugging session into a five-day one.
 
 You can verify Aria from inside the guest: CPUID leaf `0x40000000` returns the
 vendor string `AriaAriaAria` in `EBX:ECX:EDX`, and leaf `0x40000001` returns the
-interface signature `A0.1`. This is set by `ARIA_ANNOUNCE_VENDOR` in
-[vmm/vmm.c](vmm/vmm.c).
+interface signature. Both are driven by `aria_identity` in
+[vmm/vmm.c](vmm/vmm.c), which `anon` sets to the anonymous mode.
 
 ## Layout
 
@@ -67,7 +74,7 @@ Aria is a UEFI application, so it has to run before the OS is booted.
 
 1. Copy `AriaEfi.efi` to a USB drive.
 2. Boot the UEFI Shell from that drive.
-3. Run `AriaEfi.efi`.
+3. Run `AriaEfi.efi`, or `AriaEfi.efi anon` for the anonymous identity.
 
 Aria configures the VMCS for the current processor, executes `VMLAUNCH`, and
 returns to the firmware. The firmware's boot manager then loads Windows, which
@@ -84,7 +91,9 @@ MIT — see [LICENSE](LICENSE).
 
 ## Hypervisor interface
 
-Aria announces itself rather than trying to hide.
+Aria announces itself rather than trying to hide. This whole interface exists only
+in the default announcing mode: under `anon`, these leaves fall through to the
+hardware and `VMCALL` raises `#UD`.
 
 | CPUID leaf | Returns |
 |---|---|

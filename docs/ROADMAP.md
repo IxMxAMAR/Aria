@@ -115,9 +115,16 @@ In rough order of what a general-purpose guest would notice first:
 
 ## Explicitly out of scope
 
-Making Aria hard to detect. It announces itself through CPUID leaf `0x40000000`
-and exposes a documented hypercall ABI; that is deliberate. A guest can always
-tell it is virtualised, which is the honest design and the one worth building.
+Concealment. Aria announces itself through CPUID leaf `0x40000000` and exposes a
+documented hypercall ABI; that is deliberate, and a guest can always tell it is
+virtualised.
+
+The `anon` load option added in this pass suppresses the *signature* — no vendor
+leaf, no hypervisor CPUID bit, `VMCALL` reflected as `#UD` — and that is as far as
+this project goes. It is not concealment, and the difference is not a matter of
+effort: CPUID always causes a VM exit in non-root operation, so the presence of a
+hypervisor is measurable regardless of what the leaf returns. `docs/STATUS.md`
+enumerates the remaining tells and the cost of each.
 
 ## Progress
 
@@ -134,6 +141,11 @@ tell it is virtualised, which is the honest design and the one worth building.
   off automatically on a CPU that does not allow it.
 - **5 — nested VMX.** Not started. Deliberately behind item 0.
 - **6, 7 — breadth.** Not started.
+- **Identity mode.** Announcing stays the default; `AriaEfi.efi anon` suppresses
+  the signature. The cheapest remaining tell to close is the VMX MSR read leak
+  (MSR reads are not intercepted at all, so `RDMSR 0x480` contradicts a CPUID
+  that says VMX is absent). Everything else is listed with a cost in
+  `docs/STATUS.md`.
 - Diagnostics, which is not a roadmap item but has absorbed most of the work:
   fatal exits now dump reason, qualification, `RIP`, `RSP`, GPA and exit count to
   VGA as well as serial, because a desktop with no serial has only the screen.

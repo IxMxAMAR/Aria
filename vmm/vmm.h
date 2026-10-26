@@ -201,6 +201,14 @@ extern VMM_STATE g_vmm;
 #define ARIA_HC_TSC_OFFSET   5
 #define ARIA_HC_MAX          ARIA_HC_TSC_OFFSET
 
+// Guest-visible identity, selected at load time (efi/main.c parses the UEFI load
+// options). ANNOUNCE is the documented default: the guest is told the hypervisor
+// is there. ANONYMOUS suppresses the signature, not the evidence — see
+// docs/STATUS.md, "Anonymous mode".
+#define ARIA_IDENTITY_ANNOUNCE   0u
+#define ARIA_IDENTITY_ANONYMOUS  1u
+extern uint32_t aria_identity;
+
 void vmm_handle_exit(GUEST_REGS* regs);
 
 static inline void vmm_memset(void* dst, uint8_t val, size_t len) {

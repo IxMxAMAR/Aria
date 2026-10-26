@@ -33,6 +33,7 @@ Please fix the document.
 | EPT protection of hypervisor memory | implemented | `ept_hide_range` + `ept_protect_own_tables` |
 | Hypervisor lifetime across `ExitBootServices` | implemented | `efi/loader.c` |
 | SMP / AP virtualisation | implemented | `efi/smp.c` |
+| Guest-visible identity | implemented | announce (default) or anonymous, chosen by UEFI load options — see "Anonymous mode" |
 
 ## Interception
 
@@ -109,6 +110,62 @@ Aria announces itself rather than trying to hide.
 An unknown call returns RAX = 1. This is the point of the interface: a guest can
 confirm the hypervisor is really there, how many exits it has taken, and whether
 its RAM is mapped cacheable, rather than trusting the hypervisor's own log.
+
+## Anonymous mode
+
+Selected at load time, not build time:
+
+    AriaEfi.efi          announce (default)
+    AriaEfi.efi anon     anonymous
+
+The option is read from `EFI_LOADED_IMAGE_PROTOCOL->LoadOptions` in
+`efi/main.c` and lands in `aria_identity` (`vmm/vmm.c`). Anything unrecognised
+leaves the announcing default in place, deliberately: concealment should be asked
+for, not acquired by mistyping.
+
+This reverses the design principle the README used to state outright, so it is
+worth being precise about what it buys.
+
+### What it removes — the signature
+
+| Surface | Announce | Anonymous |
+|---|---|---|
+| CPUID `0x40000000` | `"AriaAriaAria"`, EAX = 0x40000002 | falls through to the hardware query |
+| CPUID `0x40000001` | ABI version, feature flags, max call | falls through |
+| CPUID `0x40000002` | live exit counter | falls through |
+| CPUID `0x40000003`–`0x4000000F` | zeroed | falls through |
+| CPUID.1:ECX[31] | set | cleared |
+| `VMCALL` | hypercall ABI | `#UD`, RIP not advanced |
+
+### What it does not remove — the evidence
+
+Each row is a working detector against the current tree, with what it would cost
+to close. This is the part that matters: the mode is not a stealth mode, and
+calling it one would be dishonest.
+
+| Evidence | Why it survives | Cost to close |
+|---|---|---|
+| **`CPUID` timing** | CPUID *always* causes a VM exit in non-root operation — there is no control bit for it. Each exit costs three VMCS accesses (read RIP, write RIP, write TSC offset) plus the handler. | Not closable with VMX. Only reducible: shorten the exit path. |
+| **VMX MSRs** | MSR *reads* are not intercepted at all, so `RDMSR 0x480` (`IA32_VMX_BASIC`) returns a valid VMCS revision ID and `IA32_FEATURE_CONTROL` bit 2 still says VMXON is enabled. | Low. Extend the bitmap to the read side and return "not supported" values: ~60 lines in `msr_bitmap.c` plus a read handler. |
+| **The contradiction** | CPUID says VMX absent while the MSRs say present. No real CPU produces that pair, so masking one without the other is a *stronger* tell than announcing. | Same fix as above, plus a decision about what `IA32_FEATURE_CONTROL` should read and whether writes to it should fault. |
+| **`CR4` and MSR write latency** | `CR4_GUEST_HOST_MASK` is `CR4_VMXE` and eight MSRs are write-intercepted, so each write exits and can be timed. | Medium, and it fights correctness: `handle_msr_write` exists precisely because those writes would otherwise be reverted at the next entry. |
+| **TSC behaviour** | `VMCS_TSC_OFFSET` freezes the guest TSC while in root context, so RDTSC diverges from any reference clock by roughly the time spent in the hypervisor. The accumulator is also a non-atomic global shared by every AP. | Medium: TSC scaling, plus a per-CPU accumulator. |
+| **EPT holes** | Hypervisor pages are no-access in the EPT, so a detector that walks guest-physical RAM takes an EPT violation — and `ARIA_STRICT_EXITS` halts the machine. That is the loudest possible answer. | High, and it trades directly against EPT protection: faking reads of those pages needs an emulation path that does not exist. |
+| **`VMCALL(4)`** | `ARIA_HC_FINALIZE` is still answered in anonymous mode, because the `ExitBootServices` hook needs a root-context entry point. | Low: gate it on a magic register value rather than the call number. |
+| **Interrupts** | Not a leak. Nothing is virtualised — no virtual interrupt delivery, no TPR shadow, no APIC-access page — so interrupt behaviour and latency are native. | — |
+
+### Cost, measured
+
+Compiling the announcement out entirely was 512 bytes smaller (36,864 against
+37,376). Keeping both paths and selecting at runtime costs 512 bytes over the
+announce-only build (37,888 against 37,376), because the vendor leaf, the ABI
+leaf and the hypercall path are all still in the image.
+
+The honest summary: anonymous mode is cheap and it defeats a casual `cpuid`
+check. It does not defeat a detector that measures CPUID cost, which is the first
+thing a serious one does, and it cannot, because VMX requires CPUID to exit. The
+reachable goal is "no name, no ABI, no gratuitous tells". The unreachable one is
+"invisible".
 
 ## Surviving `ExitBootServices`
 
@@ -303,9 +360,9 @@ layer either. Read this before running it on hardware you care about.
 no errors and no warnings from Aria's own sources, and produces:
 
 ```
-AriaEfi.efi   37,376 bytes
+AriaEfi.efi   37,888 bytes
 PE32+, machine 0x8664, subsystem 10 (EFI Application), entry RVA 0x1020
-SHA-256  AA905D94A0D163DDBEE250BCDE1F78AFEF87F12A1E419F904CFFC3C2A5ED858A
+SHA-256  2BCA2A2F29839111E7EC702DC3992E11EFD83C8525EFBFECFA68D7E95E623CBF
 ```
 
 on Visual Studio 18 Community with MSVC 14.50.35717, against EDK2

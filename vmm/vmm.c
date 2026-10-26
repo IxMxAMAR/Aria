@@ -8,14 +8,27 @@
 VMM_STATE g_vmm = {0};
 
 // ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+//
+// ARIA_IDENTITY_ANNOUNCE (the default) is the design the README describes: Aria
+// tells the guest it is there, through the hypervisor CPUID leaf and the VMCALL
+// hypercall ABI, and the guest is expected to use that.
+//
+// ARIA_IDENTITY_ANONYMOUS suppresses the *signature*: leaves 0x40000000-0x4000000F
+// fall through to the hardware, CPUID.1:ECX[31] is cleared, and VMCALL is
+// reflected as #UD, which is what a CPU without VMX would do.
+//
+// It does not suppress the *evidence*, and nothing here should be read as
+// claiming otherwise. CPUID always causes a VM exit in non-root operation — there
+// is no control bit to turn it off — so every CPUID costs an exit and the exit is
+// measurable. The VMX MSRs (0x480-0x48F, and IA32_FEATURE_CONTROL) are readable
+// because MSR reads are not intercepted at all. See docs/STATUS.md.
+uint32_t aria_identity = ARIA_IDENTITY_ANNOUNCE;
+
+// ---------------------------------------------------------------------------
 // Build-time behaviour switches
 // ---------------------------------------------------------------------------
-
-// Announce Aria to the guest via the hypervisor CPUID leaf (0x40000000). This is
-// what a real hypervisor does, and it makes the hypervisor observable from inside
-// the guest: `cpuid` in the guest shows the "AriaAriaAria" vendor string.
-// Set to 0 for a fully transparent passthrough (guest cannot tell it is virtualised).
-#define ARIA_ANNOUNCE_VENDOR 1
 
 // On an unhandled VM exit: 1 = report and stop (loud, diagnosable).
 // 0 = log and skip the instruction (silent guest-state corruption; debug only).
@@ -166,8 +179,22 @@ static void panic_dump(const char* tag) {
 // ---------------------------------------------------------------------------
 #define ARIA_ABI_VERSION     0x00010000ULL
 
-static void handle_hypercall(GUEST_REGS* regs) {
+// Returns 1 if the call was handled, 0 if an exception was injected and the
+// instruction must be re-executed.
+static int handle_hypercall(GUEST_REGS* regs) {
     uint64_t nr = regs->rax;
+
+    // In anonymous mode a VMCALL has to behave the way it would on a CPU without
+    // VMX: #UD, with the guest RIP left on the instruction so the guest's own
+    // fault handler reports the right address. ARIA_HC_FINALIZE is the single
+    // exception, because the ExitBootServices hook needs a root-context entry
+    // point and a guest cannot VMWRITE for itself. It is harmless if some other
+    // guest issues it: it records the handoff and checks the host state.
+    if (aria_identity == ARIA_IDENTITY_ANONYMOUS && nr != ARIA_HC_FINALIZE) {
+        inject_exception(6 /* #UD */, 0);
+        return 0;
+    }
+
     regs->rax = 0;
     switch (nr) {
     case ARIA_HC_VERSION:
@@ -190,15 +217,16 @@ static void handle_hypercall(GUEST_REGS* regs) {
         regs->rbx = (uint64_t)aria_tsc_offset;
         break;
     case ARIA_HC_FINALIZE:
-        // Relocate the image and repoint the VMCS host state. Issued by the
-        // ExitBootServices hook, which runs as the guest and so cannot VMWRITE
-        // for itself. Root context only, which is where this handler runs.
+        // Record the ExitBootServices handoff and verify the host state that was
+        // installed at launch. Issued by the hook, which runs as the guest and so
+        // cannot VMWRITE for itself. Root context only, which is where this runs.
         aria_loader_finalize();
         break;
     default:
         regs->rax = 1;
         break;
     }
+    return 1;
 }
 
 void vmm_handle_exit(GUEST_REGS* regs) {
@@ -232,61 +260,69 @@ void vmm_handle_exit(GUEST_REGS* regs) {
         uint32_t leaf    = (uint32_t)regs->rax;
         uint32_t subleaf = (uint32_t)regs->rcx;
 
-#if ARIA_ANNOUNCE_VENDOR
-        // Hypervisor vendor leaf. The 12-byte string is returned in EBX:ECX:EDX
-        // in little-endian byte order ("AriaAriaAria").
-        if (leaf == 0x40000000) {
-            regs->rax = 0x40000002;         // highest supported hypervisor leaf
-            regs->rbx = 0x61697241;         // "Aria"
-            regs->rcx = 0x61697241;         // "Aria"
-            regs->rdx = 0x61697241;         // "Aria"
-            advance_guest_rip();
-            break;
+        // Announce mode only. In anonymous mode these leaves are not special:
+        // they fall through to the hardware query below, which is what a machine
+        // with no hypervisor present would return.
+        if (aria_identity == ARIA_IDENTITY_ANNOUNCE) {
+            // Hypervisor vendor leaf. The 12-byte string is returned in
+            // EBX:ECX:EDX in little-endian byte order ("AriaAriaAria").
+            if (leaf == 0x40000000) {
+                regs->rax = 0x40000002;     // highest supported hypervisor leaf
+                regs->rbx = 0x61697241;     // "Aria"
+                regs->rcx = 0x61697241;     // "Aria"
+                regs->rdx = 0x61697241;     // "Aria"
+                advance_guest_rip();
+                break;
+            }
+            if (leaf == 0x40000001) {
+                // Interface description: ABI version in EAX, feature flags in
+                // EBX, highest hypercall number in ECX. A guest discovers the
+                // interface rather than hardcoding assumptions about it.
+                regs->rax = ARIA_ABI_VERSION;
+                regs->rbx = (1u << 0)       // VMCALL hypercalls
+                          | (1u << 1)       // exit statistics
+                          | (1u << 2)       // EPT memory-typing report
+                          | (1u << 3)       // MSR write interception
+                          | (1u << 4);      // TSC offsetting
+                regs->rcx = ARIA_HC_MAX;    // highest hypercall implemented
+                regs->rdx = 0;
+                advance_guest_rip();
+                break;
+            }
+            if (leaf == 0x40000002) {
+                // Live exit counter: the guest can observe that the hypervisor
+                // is actually running underneath it instead of taking it on faith.
+                uint64_t n = (uint64_t)aria_exit_count;
+                regs->rax = n & 0xFFFFFFFF;
+                regs->rbx = n >> 32;
+                regs->rcx = 0; regs->rdx = 0;
+                advance_guest_rip();
+                break;
+            }
+            if (leaf >= 0x40000003 && leaf <= 0x4000000F) {
+                regs->rax = 0; regs->rbx = 0; regs->rcx = 0; regs->rdx = 0;
+                advance_guest_rip();
+                break;
+            }
         }
-        if (leaf == 0x40000001) {
-            // Interface description: ABI version in EAX, feature flags in EBX,
-            // highest hypercall number in ECX. A guest discovers the interface
-            // rather than hardcoding assumptions about what Aria supports.
-            regs->rax = ARIA_ABI_VERSION;
-            regs->rbx = (1u << 0)             // VMCALL hypercalls
-                      | (1u << 1)             // exit statistics
-                      | (1u << 2)             // EPT memory-typing report
-                      | (1u << 3)             // MSR write interception
-                      | (1u << 4);            // TSC offsetting
-            regs->rcx = ARIA_HC_MAX;          // highest hypercall implemented
-            regs->rdx = 0;
-            advance_guest_rip();
-            break;
-        }
-        if (leaf == 0x40000002) {
-            // Live exit counter: the guest can observe that the hypervisor is
-            // actually running underneath it instead of taking that on faith.
-            uint64_t n = (uint64_t)aria_exit_count;
-            regs->rax = n & 0xFFFFFFFF;
-            regs->rbx = n >> 32;
-            regs->rcx = 0; regs->rdx = 0;
-            advance_guest_rip();
-            break;
-        }
-        if (leaf >= 0x40000003 && leaf <= 0x4000000F) {
-            regs->rax = 0; regs->rbx = 0; regs->rcx = 0; regs->rdx = 0;
-            advance_guest_rip();
-            break;
-        }
-#endif
 
         int info[4];
         extern void __cpuidex(int info[4], int leaf, int sub);
         __cpuidex(info, leaf, (int)subleaf);
 
         if (leaf == 1) {
-#if ARIA_ANNOUNCE_VENDOR
-            info[2] = (int)((uint32_t)info[2] | (1u << 31)); // hypervisor-present
-#else
-            info[2] = (int)((uint32_t)info[2] & ~(1u << 31));
-#endif
+            // ECX[31] is the architectural "a hypervisor is present" bit. Set in
+            // announce mode, cleared in anonymous mode.
+            if (aria_identity == ARIA_IDENTITY_ANNOUNCE) {
+                info[2] = (int)((uint32_t)info[2] | (1u << 31));
+            } else {
+                info[2] = (int)((uint32_t)info[2] & ~(1u << 31));
+            }
             // VMX is reported as absent: nested VMX is not implemented yet, so a
             // guest that tried VMXON would fail anyway. Re-enable in Phase 2.
+            // Note that this is itself a tell in anonymous mode: IA32_FEATURE_CONTROL
+            // and IA32_VMX_BASIC still say otherwise, because MSR reads are not
+            // intercepted. See docs/STATUS.md, "Anonymous mode".
             info[2] = (int)((uint32_t)info[2] & ~(1u << 5));
         }
 
@@ -343,8 +379,7 @@ void vmm_handle_exit(GUEST_REGS* regs) {
         break;
 
     case EXIT_REASON_VMCALL: { // 18
-        handle_hypercall(regs);
-        advance_guest_rip();
+        if (handle_hypercall(regs)) advance_guest_rip();
         break;
     }
 
